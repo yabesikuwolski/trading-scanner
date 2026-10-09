@@ -14,10 +14,15 @@ BIAS_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
 
 
 def _post(method, **kwargs):
+    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+        return False
+
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
     try:
         r = requests.post(url, timeout=15, **kwargs)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            print(f"[Telegram] {method} HTTP {r.status_code}: {r.text[:200]}")
+            return False
         return True
     except Exception as e:
         print(f"[Telegram] {method} error: {e}")
@@ -33,18 +38,23 @@ def send_message(text):
 
 
 def send_photo(photo_path, caption=""):
-    with open(photo_path, "rb") as f:
-        return _post("sendPhoto", data={
-            "chat_id": config.TELEGRAM_CHAT_ID,
-            "caption": caption[:1024],
-            "parse_mode": "HTML",
-        }, files={"photo": f})
+    try:
+        with open(photo_path, "rb") as f:
+            return _post("sendPhoto", data={
+                "chat_id": config.TELEGRAM_CHAT_ID,
+                "caption": caption[:1024],
+                "parse_mode": "HTML",
+            }, files={"photo": f})
+    except FileNotFoundError:
+        print(f"[Telegram] photo not found: {photo_path}")
+        return False
 
 
 def format_alert(symbol, analysis, scoring, alert_stage="setup_developing"):
     from scanner.scoring_engine import GRADE_EMOJI
     bias = analysis.get("bias", "neutral")
-    levels = analysis.get("levels") or {}
+    signal = analysis.get("signal")
+    levels = signal or {}
     conditions = analysis.get("conditions", [])
     session = analysis.get("session", "unknown").replace("_", " ").title()
     grade = scoring.get("grade", "Standard")
@@ -64,9 +74,14 @@ def format_alert(symbol, analysis, scoring, alert_stage="setup_developing"):
     msg += f"Score: [{progress_bar}] {score}/{max_score}\n"
     msg += f"Bias: {bias_emoji} <b>{bias.upper()}</b> | Session: {session}\n\n"
 
-    if conditions:
+    if signal:
+        msg += f"<b>Potential Signal:</b> {signal['type']} ({signal['direction']})\n"
+        msg += f"<b>Entry condition:</b> {signal['entry_condition']}\n\n"
+
+    signal_conditions = signal.get("conditions", conditions) if signal else conditions
+    if signal_conditions:
         msg += "<b>Conditions Met:</b>\n"
-        for c in conditions:
+        for c in signal_conditions:
             msg += f"  ✓ {c}\n"
         msg += "\n"
 
@@ -77,7 +92,21 @@ def format_alert(symbol, analysis, scoring, alert_stage="setup_developing"):
         msg += f"  🎯 TP1:    <code>{levels.get('tp1', '—')}</code>  (2R)\n"
         msg += f"  🎯 TP2:    <code>{levels.get('tp2', '—')}</code>  (3R)\n\n"
 
-    msg += "<i>Decision support only — manual execution required.</i>"
+    simulation_plan = levels.get("simulation_plan") or {}
+    if simulation_plan:
+        volume = simulation_plan.get("position_size")
+        volume_text = f"{volume:g}" if volume is not None else "not executable"
+        msg += "<b>Simulation account:</b>\n"
+        msg += (
+            f"  Risk: <code>${simulation_plan['risk_amount']:.2f}</code> | "
+            f"2R reward: <code>${simulation_plan['expected_profit']:.2f}</code>\n"
+        )
+        msg += (
+            f"  Volume: <code>{volume_text}</code> | "
+            f"Sizing: <code>{simulation_plan['sizing_status']}</code>\n\n"
+        )
+
+    msg += "<i>Conditional strategy scenario only. No order is placed; manual decision required.</i>"
     return msg
 
 

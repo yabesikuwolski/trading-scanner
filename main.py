@@ -11,6 +11,7 @@ from scanner.news_filter import is_news_blackout, fetch_calendar
 from alerts.telegram_bot import send_alert, send_message, send_risk_alert, send_startup_message
 from risk.risk_manager import RiskManager
 from database.db_manager import init_db, save_setup, log_risk
+from scanner.csv_market_data import store_market_bars
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +35,35 @@ def _cooldown_ok(key: str) -> bool:
     return True
 
 
+def format_signal_summary(symbol, analysis, scoring):
+    bias = analysis.get("bias", "neutral").upper()
+    conditions = analysis.get("conditions", [])
+    signal = analysis.get("signal")
+    grade = scoring.get("grade", "Standard")
+    score = scoring.get("score", 0)
+
+    if not signal:
+        return f"No actionable setup {symbol} | Bias={bias} | Score={score} | Grade={grade}"
+
+    parts = [
+        f"Potential signal {signal['type']} {symbol}",
+        f"Bias={bias}",
+        f"Grade={grade}",
+        f"Score={score}",
+        f"Entry={signal['entry']}",
+        f"SL={signal['sl']}",
+        f"TP1={signal['tp1']}",
+        f"TP2={signal['tp2']}",
+        f"RR={signal['rr']}R",
+        f"Trigger={signal['entry_condition']}",
+    ]
+
+    signal_conditions = signal.get("conditions", conditions)
+    if signal_conditions:
+        parts.append(f"Reasons={'; '.join(signal_conditions)}")
+    return " | ".join(parts)
+
+
 def determine_stage(scoring, analysis) -> str:
     grade = scoring.get("grade")
     conditions = analysis.get("conditions", [])
@@ -47,13 +77,49 @@ def determine_stage(scoring, analysis) -> str:
 
 
 def scan_once(risk_manager: RiskManager):
-    account = get_account_info()
-    if not account:
-        log.warning("Could not fetch account info from MT5")
-        return
+    market_data = {}
+    for symbol in config.SYMBOLS:
+        try:
+            frames = {}
+            for timeframe, count in (
+                (config.HTF, 200),
+                (config.MTF, 200),
+                (config.LTF, 100),
+            ):
+                frame = get_bars(symbol, timeframe, count)
+                if frame is None:
+                    log.warning(f"{symbol} {timeframe}: failed to fetch bars")
+                    continue
+                frames[timeframe] = frame
+                try:
+                    stored_count = store_market_bars(
+                        frame, symbol, timeframe, "BIQUOTE"
+                    )
+                    log.debug(
+                        f"Archived {stored_count} {symbol} {timeframe} BiQuote bars"
+                    )
+                except Exception:
+                    log.exception(
+                        f"{symbol} {timeframe}: failed to archive BiQuote bars"
+                    )
+            if all(timeframe in frames for timeframe in (
+                config.HTF, config.MTF, config.LTF
+            )):
+                market_data[symbol] = frames
+            else:
+                log.warning(f"{symbol}: skipping analysis because timeframe data is incomplete")
+        except Exception:
+            log.exception(f"Error fetching market data for {symbol}")
 
-    balance = account.get("balance", 0)
-    equity = account.get("equity", balance)
+    account = get_account_info() or {}
+    if not account:
+        balance = 10000.0
+        equity = 10000.0
+        log.info("No broker account connected; scanner running in data-only mode with fallback risk baseline.")
+    else:
+        balance = account.get("balance", 0)
+        equity = account.get("equity", balance)
+
     risk_status = risk_manager.check_risk(balance, equity)
     log_risk(balance, equity, risk_status)
 
@@ -69,13 +135,12 @@ def scan_once(risk_manager: RiskManager):
 
     for symbol in config.SYMBOLS:
         try:
-            htf_df = get_bars(symbol, config.HTF, 200)
-            mtf_df = get_bars(symbol, config.MTF, 200)
-            ltf_df = get_bars(symbol, config.LTF, 100)
-
-            if htf_df is None or mtf_df is None or ltf_df is None:
-                log.warning(f"{symbol}: failed to fetch bars")
+            frames = market_data.get(symbol)
+            if frames is None:
                 continue
+            htf_df = frames[config.HTF]
+            mtf_df = frames[config.MTF]
+            ltf_df = frames[config.LTF]
 
             analysis = analyze_symbol(htf_df, mtf_df, ltf_df, symbol)
             scoring = score_setup(analysis)
@@ -86,8 +151,9 @@ def scan_once(risk_manager: RiskManager):
                 f"{symbol}: bias={analysis['bias']} score={score} grade={grade} "
                 f"conditions={analysis['conditions']}"
             )
+            log.info(format_signal_summary(symbol, analysis, scoring))
 
-            if grade is None:
+            if grade is None or analysis.get("signal") is None:
                 continue
 
             # News blackout check
@@ -110,8 +176,11 @@ def scan_once(risk_manager: RiskManager):
             chart_path = generate_chart(symbol, ltf_df, analysis, scoring, config.LTF)
             save_setup(symbol, config.LTF, analysis, scoring, chart_path)
             stage = determine_stage(scoring, analysis)
-            send_alert(symbol, analysis, scoring, chart_path, stage)
-            log.info(f"Alert sent — {symbol} {grade} (score {score}) stage={stage}")
+            alert_sent = send_alert(symbol, analysis, scoring, chart_path, stage)
+            if alert_sent:
+                log.info(f"Telegram alert sent — {symbol} {grade} (score {score}) stage={stage}")
+            else:
+                log.info(f"Signal logged locally; Telegram unavailable — {symbol} {grade}")
 
         except Exception:
             log.exception(f"Error scanning {symbol}")
@@ -123,7 +192,7 @@ def main():
 
     try:
         connect()
-        log.info("Connected to MetaTrader 5")
+        log.info("Connected to BiQuote data source")
     except RuntimeError as e:
         log.error(str(e))
         return

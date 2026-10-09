@@ -36,14 +36,6 @@ def score_setup(analysis):
         score += 2
         breakdown.append(f"HTF Bias ({bias}): +2")
 
-    if analysis.get("bos"):
-        score += 2
-        breakdown.append("BOS confirmed: +2")
-
-    if analysis.get("liquidity_sweep"):
-        score += 2
-        breakdown.append("Liquidity Sweep: +2")
-
     active_fvgs = [f for f in analysis.get("fvgs", []) if not f["filled"]]
     if active_fvgs:
         score += 2
@@ -71,7 +63,7 @@ def score_setup(analysis):
 
     return {
         "score": score,
-        "max_score": 14,
+        "max_score": 10,
         "grade": grade,
         "breakdown": breakdown,
     }

@@ -6,12 +6,28 @@ from datetime import datetime, timezone
 def get_htf_bias(df):
     if len(df) < 50:
         return "neutral"
+
     ema20 = df["Close"].ewm(span=20).mean()
     ema50 = df["Close"].ewm(span=50).mean()
     last_close = df["Close"].iloc[-1]
-    if last_close > ema20.iloc[-1] > ema50.iloc[-1]:
+    ema20_slope = ema20.iloc[-1] - ema20.iloc[-3] if len(ema20) >= 3 else 0
+    ema50_slope = ema50.iloc[-1] - ema50.iloc[-3] if len(ema50) >= 3 else 0
+
+    # A strong recent short-term trend can be bullish or bearish even when the
+    # longer EMA remains above or below price. Treat a clear EMA20 trend as the
+    # decisive signal instead of forcing a neutral bias whenever the long EMA is
+    # still misaligned.
+    if last_close > ema20.iloc[-1] and (
+        ema20.iloc[-1] >= ema50.iloc[-1] or ema20_slope >= 0
+    ):
         return "bullish"
-    if last_close < ema20.iloc[-1] < ema50.iloc[-1]:
+    if last_close < ema20.iloc[-1] and (
+        ema20.iloc[-1] <= ema50.iloc[-1] or ema20_slope <= 0
+    ):
+        return "bearish"
+    if last_close > ema50.iloc[-1] and ema50_slope >= 0:
+        return "bullish"
+    if last_close < ema50.iloc[-1] and ema50_slope <= 0:
         return "bearish"
     return "neutral"
 
@@ -93,12 +109,12 @@ def detect_fvg(df):
                 "filled": False,
             })
 
-    last_close = df["Close"].iloc[-1]
     for fvg in fvgs:
+        subsequent_bars = df.iloc[int(fvg["index"]) + 1:]
         if fvg["type"] == "bullish_fvg":
-            fvg["filled"] = last_close < fvg["bottom"]
+            fvg["filled"] = bool((subsequent_bars["Low"] <= fvg["bottom"]).any())
         else:
-            fvg["filled"] = last_close > fvg["top"]
+            fvg["filled"] = bool((subsequent_bars["High"] >= fvg["top"]).any())
     return fvgs
 
 
@@ -183,21 +199,20 @@ def calculate_atr(df, period=14):
     return tr.rolling(period).mean().iloc[-1]
 
 
-def calculate_entry_levels(df, bias, swing_highs, swing_lows):
+def calculate_entry_levels(df, bias, swing_highs, swing_lows, entry_price=None):
     last_close = df["Close"].iloc[-1]
+    entry = float(last_close if entry_price is None else entry_price)
     atr = calculate_atr(df)
     if np.isnan(atr) or atr == 0:
         atr = (df["High"].iloc[-1] - df["Low"].iloc[-1])
 
     if bias == "bullish":
-        entry = last_close
         sl = (swing_lows[-1][1] - atr * 0.1) if swing_lows else (entry - atr)
         risk = max(entry - sl, atr * 0.5)
         tp1 = round(entry + risk * 2, 5)
         tp2 = round(entry + risk * 3, 5)
         sl = round(sl, 5)
     else:
-        entry = last_close
         sl = (swing_highs[-1][1] + atr * 0.1) if swing_highs else (entry + atr)
         risk = max(sl - entry, atr * 0.5)
         tp1 = round(entry - risk * 2, 5)
@@ -214,7 +229,94 @@ def calculate_entry_levels(df, bias, swing_highs, swing_lows):
     }
 
 
-def analyze_symbol(htf_df, mtf_df, ltf_df, symbol):
+def _fvg_has_been_retested(df, fvg):
+    subsequent_bars = df.iloc[int(fvg["index"]) + 1:]
+    if subsequent_bars.empty:
+        return False
+    touched = (
+        (subsequent_bars["Low"] <= fvg["top"])
+        & (subsequent_bars["High"] >= fvg["bottom"])
+    )
+    return bool(touched.any())
+
+
+def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
+                    ltf_swing_highs, ltf_swing_lows, fvgs, retest,
+                    rejection, conditions, mtf_close):
+    if bias not in ("bullish", "bearish") or df.empty:
+        return None
+
+    current_price = float(df["Close"].iloc[-1])
+    signal_type = None
+    entry = None
+    entry_condition = None
+
+    if retest and rejection:
+        signal_type = "MARKET/IMMEDIATE"
+        entry = current_price
+        entry_condition = "M15 retest confirmed by a directional rejection candle"
+
+    if signal_type is None:
+        for fvg in reversed(fvgs[-6:]):
+            if fvg["filled"] or _fvg_has_been_retested(df, fvg):
+                continue
+            if bias == "bullish" and fvg["type"] == "bullish_fvg":
+                if fvg["top"] < current_price:
+                    signal_type = "BUY LIMIT"
+                    entry = float(fvg["bottom"])
+                    entry_condition = (
+                        f"M15 retrace into bullish FVG "
+                        f"{fvg['bottom']}-{fvg['top']}"
+                    )
+                    break
+            elif bias == "bearish" and fvg["type"] == "bearish_fvg":
+                if fvg["bottom"] > current_price:
+                    signal_type = "SELL LIMIT"
+                    entry = float(fvg["top"])
+                    entry_condition = (
+                        f"M15 retrace into bearish FVG "
+                        f"{fvg['bottom']}-{fvg['top']}"
+                    )
+                    break
+
+    if signal_type is None and bias == "bullish" and mtf_swing_highs:
+        breakout_level = float(mtf_swing_highs[-1][1])
+        if breakout_level > current_price and breakout_level > mtf_close:
+            signal_type = "BUY STOP"
+            entry = breakout_level
+            entry_condition = f"H1 close above swing high {breakout_level}"
+    elif signal_type is None and bias == "bearish" and mtf_swing_lows:
+        breakdown_level = float(mtf_swing_lows[-1][1])
+        if breakdown_level < current_price and breakdown_level < mtf_close:
+            signal_type = "SELL STOP"
+            entry = breakdown_level
+            entry_condition = f"H1 close below swing low {breakdown_level}"
+
+    if signal_type is None:
+        return None
+
+    levels = calculate_entry_levels(
+        df, bias, ltf_swing_highs, ltf_swing_lows, entry_price=entry
+    )
+    is_bullish = bias == "bullish"
+    valid_levels = (
+        levels["sl"] < levels["entry"] < levels["tp1"]
+        if is_bullish
+        else levels["tp1"] < levels["entry"] < levels["sl"]
+    )
+    if not valid_levels:
+        return None
+
+    return {
+        "type": signal_type,
+        "direction": "BUY" if is_bullish else "SELL",
+        **levels,
+        "entry_condition": entry_condition,
+        "conditions": list(conditions),
+    }
+
+
+def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
     result = {
         "symbol": symbol,
         "bias": "neutral",
@@ -225,6 +327,7 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol):
         "rejection": None,
         "session": None,
         "levels": None,
+        "signal": None,
         "conditions": [],
     }
 
@@ -237,13 +340,9 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol):
 
     bos = detect_bos(mtf_df, swing_highs_mtf, swing_lows_mtf, bias)
     result["bos"] = bos
-    if bos:
-        result["conditions"].append("BOS")
 
     sweep = detect_liquidity_sweep(mtf_df, swing_highs_mtf, swing_lows_mtf)
     result["liquidity_sweep"] = sweep
-    if sweep:
-        result["conditions"].append("Liquidity Sweep")
 
     fvgs = detect_fvg(ltf_df)
     result["fvgs"] = fvgs
@@ -262,9 +361,32 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol):
     if rejection:
         result["conditions"].append("Rejection Candle")
 
-    utc_hour = datetime.now(timezone.utc).hour
+    analysis_time = as_of or datetime.now(timezone.utc)
+    if analysis_time.tzinfo is None:
+        analysis_time = analysis_time.replace(tzinfo=timezone.utc)
+    else:
+        analysis_time = analysis_time.astimezone(timezone.utc)
+    utc_hour = analysis_time.hour
     result["session"] = get_session(utc_hour)
 
-    result["levels"] = calculate_entry_levels(ltf_df, bias, ltf_highs, ltf_lows)
+    signal = generate_signal(
+        ltf_df,
+        bias,
+        swing_highs_mtf,
+        swing_lows_mtf,
+        ltf_highs,
+        ltf_lows,
+        active_fvgs,
+        retest,
+        rejection,
+        result["conditions"],
+        float(mtf_df["Close"].iloc[-1]),
+    )
+    result["signal"] = signal
+    if signal:
+        result["levels"] = {
+            key: signal[key]
+            for key in ("entry", "sl", "tp1", "tp2", "risk", "rr")
+        }
 
     return result
