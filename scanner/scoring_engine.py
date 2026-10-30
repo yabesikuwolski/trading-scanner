@@ -36,12 +36,20 @@ def score_setup(analysis):
         score += 2
         breakdown.append(f"HTF Bias ({bias}): +2")
 
-    active_fvgs = [f for f in analysis.get("fvgs", []) if not f["filled"]]
-    if active_fvgs:
-        score += 2
-        breakdown.append(f"Active FVG ({len(active_fvgs)}): +2")
+    if analysis.get("confirmed_bias") is not None:
+        if analysis.get("confirmed_bias") == bias:
+            score += 2
+            breakdown.append(f"MTF Trend ({bias}): +2")
+        if analysis.get("liquidity_sweep"):
+            score += 2
+            breakdown.append("Liquidity sweep: +2")
+    else:
+        active_fvgs = [f for f in analysis.get("fvgs", []) if not f["filled"]]
+        if active_fvgs:
+            score += 2
+            breakdown.append(f"Active FVG ({len(active_fvgs)}): +2")
 
-    if analysis.get("retest"):
+    if analysis.get("retest") and analysis.get("confirmed_bias") is None:
         score += 2
         breakdown.append(f"Retest ({analysis['retest']['type']}): +2")
 

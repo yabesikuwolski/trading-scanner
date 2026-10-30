@@ -19,17 +19,22 @@ class SignalLifecycleTests(unittest.TestCase):
             "bias": "bearish",
             "grade": "A",
             "score": 8,
-            "entry": 4160.551,
-            "sl": 4188.80764,
-            "tp1": 4104.03771,
+            "entry": 4180.0,
+            "sl": 4208.0,
+            "tp1": 4124.0,
         }
-        self.bar = {"high": 4168.0, "low": 4158.0, "close": 4162.0}
+        self.bar = {
+            "bar_time": "2026-10-02T11:45:00Z",
+            "high": 4175.0,
+            "low": 4170.0,
+            "close": 4172.0,
+        }
 
     def test_planned_rr_matches_two_to_one_strategy(self):
         self.assertAlmostEqual(planned_reward_risk(self.setup), 2.0, places=1)
 
     def test_remaining_rr_is_based_on_current_price(self):
-        self.assertGreater(remaining_reward_risk(self.setup, 4162.0), 1.0)
+        self.assertGreater(remaining_reward_risk(self.setup, 4172.0), 1.0)
 
     def test_ready_setup_under_age_limit(self):
         result = evaluate_setup(self.setup, self.bar, now=self.now)
@@ -44,7 +49,7 @@ class SignalLifecycleTests(unittest.TestCase):
     def test_stop_breach_invalidates_setup(self):
         result = evaluate_setup(
             self.setup,
-            {"high": 4190.0, "low": 4158.0, "close": 4189.0},
+            {**self.bar, "high": 4210.0, "close": 4209.0},
             now=self.now,
         )
         self.assertEqual(result["state"], "INVALIDATED")
@@ -64,7 +69,7 @@ class SignalLifecycleTests(unittest.TestCase):
     def test_remaining_rr_below_one_invalidates_setup(self):
         result = evaluate_setup(
             self.setup,
-            {"high": 4145.0, "low": 4139.0, "close": 4140.0},
+            {**self.bar, "high": 4165.0, "low": 4155.0, "close": 4160.0},
             now=self.now,
         )
         self.assertEqual(result["state"], "INVALIDATED")
@@ -91,6 +96,35 @@ class SignalLifecycleTests(unittest.TestCase):
         result = evaluate_setup(self.setup, old_bar, now=self.now, max_market_age_minutes=30)
         self.assertEqual(result["state"], "PRICE UNKNOWN")
         self.assertIn("live-price limit", result["reason"])
+
+    def test_limit_setup_waits_until_entry_is_touched(self):
+        result = evaluate_setup(self.setup, self.bar, now=self.now)
+        self.assertEqual(result["state"], "READY")
+        self.assertIsNone(result["entry_touched_at"])
+
+    def test_entry_touch_is_reported_without_claiming_a_fill(self):
+        touched_bar = {
+            **self.bar,
+            "high": 4182.0,
+            "low": 4178.0,
+            "close": 4180.0,
+        }
+        result = evaluate_setup(self.setup, touched_bar, now=self.now)
+        self.assertEqual(result["state"], "ENTRY TOUCHED")
+        self.assertIn("does not confirm a broker fill", result["reason"])
+        self.assertEqual(result["entry_touched_at"], "2026-10-02T11:45:00+00:00")
+
+    def test_entry_touch_persists_after_price_moves_away(self):
+        touched_setup = {**self.setup, "entry_touched_at": "2026-10-02T11:45:00+00:00"}
+        result = evaluate_setup(touched_setup, self.bar, now=self.now)
+        self.assertEqual(result["state"], "ENTRY TOUCHED")
+        self.assertEqual(result["entry_touched_at"], touched_setup["entry_touched_at"])
+
+    def test_missing_market_timestamp_is_unknown_not_ready(self):
+        bar = {key: value for key, value in self.bar.items() if key != "bar_time"}
+        result = evaluate_setup(self.setup, bar, now=self.now)
+        self.assertEqual(result["state"], "PRICE UNKNOWN")
+        self.assertIn("no valid timestamp", result["reason"])
 
 
 if __name__ == "__main__":

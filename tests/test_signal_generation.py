@@ -37,6 +37,7 @@ class GenerateSignalTests(unittest.TestCase):
 
         self.assertEqual(signal["type"], "BUY LIMIT")
         self.assertEqual(signal["entry"], 98.0)
+        self.assertEqual(signal["zone"], "BULLISH_FVG:98.00000:99.50000")
         self.assertLess(signal["entry"], 101.0)
         self.assertLess(signal["sl"], signal["entry"])
         self.assertGreater(signal["tp1"], signal["entry"])
@@ -64,6 +65,7 @@ class GenerateSignalTests(unittest.TestCase):
 
         self.assertEqual(signal["type"], "MARKET/IMMEDIATE")
         self.assertEqual(signal["entry"], 101.0)
+        self.assertEqual(signal["zone"], "BULLISH_fvg_retest_100.00000")
 
     def test_unbroken_structure_generates_buy_stop(self):
         signal = generate_signal(
@@ -73,6 +75,7 @@ class GenerateSignalTests(unittest.TestCase):
 
         self.assertEqual(signal["type"], "BUY STOP")
         self.assertEqual(signal["entry"], 102.0)
+        self.assertEqual(signal["zone"], "H1_SWING_HIGH:102.00000")
         self.assertIn("H1 close above", signal["entry_condition"])
 
     def test_retest_generates_sell_limit(self):
@@ -138,7 +141,7 @@ class GenerateSignalTests(unittest.TestCase):
 
         self.assertIsNone(signal)
 
-    def test_analyze_symbol_drops_decorative_liquidity_and_bos_conditions(self):
+    def test_analyze_symbol_requires_directional_liquidity_sweep(self):
         frame = market_bars()
         with patch("scanner.market_analyzer.get_htf_bias", return_value="bullish"), \
              patch("scanner.market_analyzer.detect_swing_points", side_effect=[([(10, 110.0)], [(10, 90.0)]), ([], [])]), \
@@ -150,8 +153,30 @@ class GenerateSignalTests(unittest.TestCase):
             result = analyze_symbol(frame, frame, frame, "XAUUSD")
 
         self.assertNotIn("BOS", result["conditions"])
-        self.assertNotIn("Liquidity Sweep", result["conditions"])
+        self.assertIn("Liquidity Sweep", result["conditions"])
+        self.assertIn("Aggressive Zone", result["conditions"])
         self.assertIn("FVG", result["conditions"])
+        self.assertEqual(result["signal"]["type"], "MARKET/IMMEDIATE")
+
+    def test_analyze_symbol_does_not_signal_without_liquidity_sweep(self):
+        frame = market_bars()
+        with patch("scanner.market_analyzer.get_htf_bias", return_value="bullish"), \
+             patch("scanner.market_analyzer.detect_swing_points", return_value=([], [])), \
+             patch("scanner.market_analyzer.detect_liquidity_sweep", return_value=None), \
+             patch("scanner.market_analyzer.detect_rejection_candle", return_value={"type": "hammer"}):
+            result = analyze_symbol(frame, frame, frame, "XAUUSD")
+
+        self.assertIsNone(result["signal"])
+
+    def test_analyze_symbol_does_not_signal_when_h1_disagrees_with_h4(self):
+        frame = market_bars()
+        with patch("scanner.market_analyzer.get_htf_bias", side_effect=["bullish", "bearish"]), \
+             patch("scanner.market_analyzer.detect_swing_points", return_value=([(10, 110.0)], [(10, 90.0)])), \
+             patch("scanner.market_analyzer.detect_liquidity_sweep", return_value={"type": "bullish_sweep", "level": 90.0}), \
+             patch("scanner.market_analyzer.detect_rejection_candle", return_value={"type": "hammer"}):
+            result = analyze_symbol(frame, frame, frame, "XAUUSD")
+
+        self.assertIsNone(result["signal"])
 
     def test_score_thresholds_match_active_conditions(self):
         full = {

@@ -37,8 +37,10 @@ Core files:
 Behavior:
 - AI is enabled through config flags
 - model calls are local and advisory-only
-- if Ollama is offline or unreachable, the scanner falls back to a conservative NO_TRADE outcome
+- if Ollama is offline, the review is stored as `unavailable`; malformed output is `invalid_response`; neither state invents a verdict
 - AI does not place orders or control execution
+- AI output does not gate qualified signals or override risk sizing, lifecycle, entry, SL, or TP
+- model output is validated against the required JSON schema before it is stored as an available review
 
 ### 3) Lifecycle persistence and audit trail
 Each setup is now persisted with lifecycle metadata and AI decision metadata.
@@ -46,7 +48,9 @@ Each setup is now persisted with lifecycle metadata and AI decision metadata.
 Persisted columns include:
 - lifecycle_state
 - lifecycle_reason
+- entry_touched_at (price touch only; not a broker fill)
 - reviewed_at
+- ai_status
 - ai_decision
 - ai_quality_score
 - ai_confidence
@@ -55,6 +59,9 @@ Persisted columns include:
 - ai_invalidations
 - ai_risk_note
 - ai_reviewed_at
+- telegram_status / telegram_error / telegram_attempted_at / telegram_sent_at
+- lifecycle Telegram delivery status and timestamp
+- trade gross R, MFE/MAE, target/stop touches, and OHLC excursion provenance
 
 This creates an auditable trail for every setup and lets the next agent reason about why a setup was accepted, ignored, invalidated, or reviewed.
 
@@ -85,41 +92,33 @@ This means:
 
 ## Current working baseline
 
-This project is currently in a partially validated state, not a fully green one.
+Verified on 2026-10-16 after signal ledger and trade execution-record updates:
+- full regression suite: `.venv/bin/pytest -q` — 140 passed, 7 subtests passed
+- the tracked provider default is BiQuote, but the ignored local `.env` currently selects `DERIV_DEMO`; AI is currently disabled in this workspace (`AI_ADVISOR_ENABLED=false`)
+- the scanner checks risk against the persistent simulation account and records provider-account metadata separately
+- simulation sizing plans, setup identity/zone, and optional AI advisory results are stored with signals
+- the latest persisted setup is checked before a repeated alert is emitted
+- AI remains disabled by default and never overrides scoring, lifecycle, or risk checks. A live local `llama3.2:3b` strict-schema smoke check returned a valid `WATCH` review: 58.89 seconds cold and 12.03 seconds warm. The configured default timeout is 75 seconds to accommodate the observed cold start; an enabled review runs synchronously and can pause the scan.
+- the qwen2.5 model named in an earlier environment was not installed; the installed local default is `llama3.2:3b`
+- Telegram delivery and lifecycle update results are persisted, but no local bot token/chat ID is configured for a real delivery check
+- account feasibility remains `UNKNOWN` when margin, verified broker specifications, or currency conversion data are unavailable
+- full replay: 76,426 M15 decisions; 28,548 repeated candidates suppressed; 21,553 candidates; 15,758 overlap-blocked; 4,482 unfilled; 249 unresolved; 1,064 resolved (356 TP1, 708 SL), 33.5% resolved-only win rate, +0.02R mean gross. An illustrative 0.05R cost changes the mean to -0.03R. The run took roughly 20 minutes and used about one CPU core in this workspace. See `reports/oanda_full_history_replay_2023-2026.md` and its CSV/metadata.
+- Signal Ledger is implemented. Each setup has an append-only decision history (`PAPER_TRACKED`, `SKIPPED` with reason, or `TRADE_LOGGED`; no event means `UNREVIEWED`) and a separate modeled-outcome record. The scanner evaluates up to 100 pending setups per scan from configured-source M15 OHLC, with four pending bars and a 96-bar horizon. These are hypothetical per-signal scenarios, independent of the replay overlap limit, separate from manual journal outcomes, and do not confirm fills or include costs.
+- Dashboard users can inspect the latest 2,000 setups on the Signal Ledger page, paper-track or skip a setup, and compare modeled OHLC results with linked journal results. Paper net R and manually reported net R are summarized separately. A journal link is user-reported; broker execution is not independently verified.
+- Trade Journal now distinguishes `PAPER`, `MANUAL_REPORTED`, and migrated legacy `UNSPECIFIED` records. It accepts entry time, position size, reported risk amount/currency, and total transaction costs/currency. Gross R is price-based; net R is calculated only when risk and costs share a currency. Recorded costs in the simulation-account currency reduce paper P/L. Manually reported trades and losses are excluded from the simulation balance and consecutive-loss gate. Old records remain classified `UNSPECIFIED` after migration.
+- The scanner was restarted on 2026-10-16 using the updated code. Two consecutive scans each updated 23 pending modeled outcomes from `DERIV-DEMO`; each batch left 20 in `MODELED_OPEN` and 3 in `WAITING_FOR_BARS`, with no terminal resolutions. One `main.py` process was confirmed running. A Streamlit dashboard is also running at `http://127.0.0.1:8501`. Continue using these processes and avoid starting duplicates. `init_db()` applies additive action/outcome and trade-metadata migrations at startup.
 
-Verified from the active project environment on 2026-10-09:
-- the repository virtual environment is active and dependencies are installed
-- the current regression run is: 78 passed, 6 failed in 1.71s
-- the failures are concentrated in the lifecycle/state validation path and one simulation-risk test
-
-The current blockers are real and should be treated as the active baseline for the next agent:
-- `tests/test_signal_lifecycle.py` is failing because the lifecycle evaluator is returning `INVALIDATED` before precedence checks for `NEWS BLOCKED`, `READY`, and clear invalidation reasons are reached
-- the reason strings for invalidation are not matching the expected wording (`minimum grade`, `below 1:1`, `stop-loss`)
-- `tests/test_main_simulation_risk.py` is failing because `main.save_broker_account_snapshot` is missing from the module even though the test patches it
-
-This means the project has working core components, but the state machine and risk-account integration are not yet fully aligned with the expected contract.
+The scanner remains advisory-only. Passing tests checks implementation behavior; it does not establish predictive performance or live-trading readiness.
 
 ---
 
 ## What the next agent should focus on
 
-### Highest-priority next step
-Repair the failing lifecycle and simulation-risk tests before expanding feature work.
-
-The next milestone should be:
-1. fix the `evaluate_setup` precedence so `NEWS BLOCKED` and `READY` states can win when appropriate
-2. correct lifecycle invalidation reason strings and grade/rr/stop validation logic to match the test contract
-3. restore the missing broker-account snapshot API expected by the simulation-risk test
-4. rerun the suite in the project venv and confirm the project is green before adding more lifecycle features
-
-This is the correct next step because the scanner already has detection, duplicate suppression, AI review support, and persistence. The current weak point is not market analysis itself; it is the contract between state evaluation, risk gating, and test expectations.
-
-### Secondary priorities
-- add richer lifecycle outcome tracking once the current state engine is green
-- add dashboard visibility for AI verdicts and setup age
-- add stronger review labels for manually dismissed setups
-- tune scoring thresholds via backtesting and comparison, not guesses
-- evaluate demo/manual trade testing only if the operator explicitly approves it
+### Next priorities
+1. Use the Signal Ledger consistently: paper-track or skip signals, and log taken trades from their setup cards so results stay linked. Record actual entry time, size, risk, and total costs when known.
+2. Replace illustrative research costs with broker-specific spread, commission, financing, margin, and slippage assumptions. Net R remains unavailable on trades missing risk or cost data.
+3. Run a genuinely forward chronological sample. The retrospective split is not untouched because the complete archive was already reviewed.
+4. Configure Telegram locally and verify one real delivery. Keep all outcomes labeled as estimates unless broker fills are confirmed.
 
 ---
 
@@ -148,27 +147,29 @@ This is the correct next step because the scanner already has detection, duplica
 - [database/db_manager.py](database/db_manager.py)
 - [scanner/setup_state.py](scanner/setup_state.py)
 - [scanner/ai_advisor.py](scanner/ai_advisor.py)
+- [scanner/setup_outcome_tracker.py](scanner/setup_outcome_tracker.py)
 - [dashboard/signal_lifecycle.py](dashboard/signal_lifecycle.py)
 - [dashboard/app.py](dashboard/app.py)
 - [tests/test_signal_generation.py](tests/test_signal_generation.py)
 - [tests/test_ai_advisor.py](tests/test_ai_advisor.py)
+- [tests/test_setup_outcome_tracker.py](tests/test_setup_outcome_tracker.py)
 - [tests/test_setup_signal_type.py](tests/test_setup_signal_type.py)
 
 ---
 
 ## Validation note
 
-The current implementation is not fully green yet. The verified baseline from the project venv is:
-- 78 passed
-- 6 failed
-- failing areas are lifecycle precedence logic and simulation-risk integration
-
-This is the current working baseline for the next AI agent.
-- activate the project venv before running tests: `. .venv/bin/activate`
-- verify with `pytest -q` from the repo root
-- prioritize the failing lifecycle/risk contracts before adding more feature work
+- The latest verified suite result is 140 passed and 7 subtests passed on 2026-10-16; rerun `.venv/bin/pytest -q` after code changes.
+- Regression coverage includes repeat suppression across separate scan calls and expiry of old dedup candidates.
+- Full OANDA replay output and assumptions are recorded in `reports/oanda_full_history_replay_2023-2026.md` and its CSV.
+- Local AI smoke check: `llama3.2:3b` returned a valid strict-schema `WATCH` review (58.89 seconds cold, 12.03 seconds warm); the default timeout is 75 seconds and AI is disabled by default.
+- The local workspace has no Telegram bot token/chat ID configured, so mocked delivery/failure tests pass but real Telegram delivery remains unverified.
+- The project contains no order-submission path; all alerts and dashboard outputs remain advisory scenarios.
+- Dedicated ledger tests cover action history, linked journal trades, pending/unfilled estimates, same-bar stop priority, and existing trade-link migration.
+- Journal tests cover reported-versus-paper separation, same-currency net R and simulation costs, mismatched currencies, entry-time normalization, and additive migration.
+- A `main.py` process from before the ledger work was left untouched; check the process list before launching another scanner instance.
 - keep duplicates suppressed, state transitions auditable, and AI advisory-only
-- evaluate the system using expectancy, drawdown, and duplicate suppression metrics once the current regressions are resolved
+- evaluate the system using expectancy, drawdown, and duplicate suppression metrics; test success alone is not strategy validation
 
 ---
 
@@ -181,6 +182,7 @@ The system should eventually produce or store structured setup records including
 - direction
 - setup_id
 - zone
+- entry trigger time, when observed
 - entry
 - sl
 - tp1
@@ -195,6 +197,8 @@ The system should eventually produce or store structured setup records including
 - outcome
 - max favorable excursion
 - max adverse excursion
+- gross R and net R only when costs are known
+- exit reason and whether TP1/TP2/SL levels were reached
 
 This will allow proper analysis of why a trade won or lost.
 
@@ -228,9 +232,4 @@ The purpose is not to never lose. The purpose is to avoid turning one losing ide
 
 ## Implementation status
 
-At this point, the project has already taken the first step:
-- duplicate same-idea setup guard implemented and regression-tested
-
-The next required step is the explicit lifecycle state engine and new setup gate.
-
-That is the next milestone.
+The persistent simulation-risk gate, account-feasibility labels, strict AI review state, Telegram delivery tracking, setup lifecycle notifications, and scanner-side repeated-setup check are integrated. Setup zones include FVG bounds, H1 swing levels, or retest levels. Replay now adds MFE/MAE and TP2 follow-through diagnostics, with report generation and chronological/regime summaries. Broker-specific costs and margin, live Telegram delivery, and a clean forward sample remain open.

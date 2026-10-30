@@ -132,14 +132,21 @@ def store_market_bars(bars, symbol, timeframe, source):
     return save_market_bars(stored)
 
 
-def load_market_bars(source, symbol, timeframe):
+def load_market_bars(source, symbol, timeframe, *, since=None):
     connection = get_connection()
-    rows = connection.execute("""
+    query = """
         SELECT bar_time, open, high, low, close, volume
         FROM market_bars
         WHERE source = ? AND symbol = ? AND timeframe = ?
-        ORDER BY bar_time
-    """, (source.strip().upper(), symbol.upper(), timeframe.upper())).fetchall()
+    """
+    parameters = [source.strip().upper(), symbol.upper(), timeframe.upper()]
+    if since is not None:
+        timestamp = pd.Timestamp(since)
+        timestamp = timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
+        query += " AND bar_time >= ?"
+        parameters.append(timestamp.isoformat())
+    query += " ORDER BY bar_time"
+    rows = connection.execute(query, parameters).fetchall()
     connection.close()
 
     if not rows:

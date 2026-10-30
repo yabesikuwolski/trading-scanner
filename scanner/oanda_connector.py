@@ -7,7 +7,7 @@ import config
 from database.db_manager import init_db, save_market_bars
 
 
-GRANULARITY_MAP = {"M15": "M15", "H1": "H1", "H4": "H4"}
+GRANULARITY_MAP = {"M5": "M5", "M15": "M15", "H1": "H1", "H4": "H4"}
 OANDA_INSTRUMENT = "XAU_USD"
 OANDA_SOURCE = "OANDA-PRACTICE"
 
@@ -43,7 +43,7 @@ def _bars_from_candles(candles):
 def get_bars(timeframe, count=200, token=None, session=requests, to_time=None):
     timeframe = timeframe.upper()
     if timeframe not in GRANULARITY_MAP:
-        raise ValueError("Supported OANDA timeframes are M15, H1, and H4")
+        raise ValueError("Supported OANDA timeframes are M5, M15, H1, and H4")
     if not 1 <= count <= 5000:
         raise ValueError("Candle count must be between 1 and 5000")
 

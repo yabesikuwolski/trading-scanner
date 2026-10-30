@@ -73,6 +73,71 @@ class BiQuoteConnectorTests(unittest.TestCase):
 
         self.assertEqual(len(bars), 1)
 
+    @patch("scanner.mt5_connector.requests.get")
+    def test_h4_uses_four_hour_utc_bars_and_drops_the_open_candle(self, mock_get):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "bars": [
+                {
+                    "openTime": "2026-10-22T08:00:00Z",
+                    "isOpen": True,
+                    "open": 4088, "high": 4095, "low": 4080, "close": 4090,
+                    "tickVolume": 100,
+                },
+                {
+                    "openTime": "2026-10-22T04:00:00Z",
+                    "isOpen": False,
+                    "open": 4092, "high": 4103, "low": 4066, "close": 4088,
+                    "tickVolume": 200,
+                },
+                {
+                    "openTime": "2026-10-22T00:00:00Z",
+                    "isOpen": False,
+                    "open": 4125, "high": 4127, "low": 4089, "close": 4092,
+                    "tickVolume": 300,
+                },
+            ]
+        }
+        mock_get.return_value = response
+
+        bars = get_bars("XAUUSD", "H4", 3)
+
+        self.assertIn("interval=4h", mock_get.call_args.args[0])
+        self.assertEqual(str(bars.index[-1]), "2026-10-22 04:00:00+00:00")
+        self.assertEqual(len(bars), 2)
+        self.assertTrue(bars.attrs["closed_verified"])
+        self.assertTrue(bars.index.is_monotonic_increasing)
+
+    @patch("scanner.mt5_connector.requests.get")
+    def test_m5_uses_five_minute_utc_bars_and_drops_the_open_candle(self, mock_get):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "bars": [
+                {
+                    "openTime": "2026-10-22T10:10:00Z",
+                    "isOpen": True,
+                    "open": 4088, "high": 4095, "low": 4080, "close": 4090,
+                    "tickVolume": 100,
+                },
+                {
+                    "openTime": "2026-10-22T10:05:00Z",
+                    "isOpen": False,
+                    "open": 4092, "high": 4103, "low": 4066, "close": 4088,
+                    "tickVolume": 200,
+                },
+            ]
+        }
+        mock_get.return_value = response
+
+        bars = get_bars("XAUUSD", "M5", 2)
+
+        self.assertIn("interval=5m", mock_get.call_args.args[0])
+        self.assertEqual(str(bars.index[-1]), "2026-10-22 10:05:00+00:00")
+        self.assertEqual(len(bars), 1)
+        self.assertTrue(bars.attrs["closed_verified"])
+
 
 if __name__ == "__main__":
     unittest.main()

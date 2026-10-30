@@ -309,6 +309,30 @@ def get_symbol_info(symbol):
     return {"symbol": deriv_symbol, "account_type": "demo"}
 
 
+def get_quote(symbol):
+    """Return the latest Deriv tick; spread is unavailable from this adapter."""
+    if symbol.upper() not in {"XAUUSD", "XAU_USD", "GOLD"}:
+        return None
+    deriv_symbol = _resolve_gold_symbol()
+    response = _request({"ticks": deriv_symbol})
+    tick = response.get("tick") or {}
+    quote = tick.get("quote")
+    epoch = tick.get("epoch")
+    if quote is None or epoch is None:
+        raise RuntimeError("Deriv returned an incomplete Gold quote")
+    return {
+        "symbol": deriv_symbol,
+        "bid": None,
+        "ask": None,
+        "mid": float(quote),
+        "spread": None,
+        "timestamp": pd.to_datetime(epoch, unit="s", utc=True).to_pydatetime(),
+        "market_state": None,
+        "stale": False,
+        "quote_age_seconds": None,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check Deriv demo account and read-only Gold candles")
     parser.add_argument("--timeframes", nargs="+", choices=GRANULARITY_MAP, default=["H4", "H1", "M15"])

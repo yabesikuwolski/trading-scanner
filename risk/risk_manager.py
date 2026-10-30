@@ -1,4 +1,5 @@
 from datetime import date
+import math
 import config
 from database.db_manager import get_recent_losses, init_db
 
@@ -28,27 +29,50 @@ class RiskManager:
         broker_min_volume = config.BROKER_MIN_VOLUME if broker_min_volume is None else float(broker_min_volume)
         broker_volume_step = config.BROKER_VOLUME_STEP if broker_volume_step is None else float(broker_volume_step)
         broker_max_volume = config.BROKER_MAX_VOLUME if broker_max_volume is None else float(broker_max_volume)
-        risk_amount = float(account_balance) * (risk_pct / 100.0)
-        stop_distance = abs(float(entry) - float(sl))
-        expected_profit = risk_amount * float(rr_multiple)
+        account_balance = float(account_balance)
+        entry = float(entry)
+        sl = float(sl)
+        stop_distance = abs(entry - sl) if math.isfinite(entry) and math.isfinite(sl) else 0.0
+        valid_balance = math.isfinite(account_balance) and account_balance > 0
+        valid_risk = math.isfinite(risk_pct) and 0 < risk_pct <= 100
+        valid_rr = math.isfinite(rr_multiple) and rr_multiple > 0
+        risk_amount = account_balance * (risk_pct / 100.0) if valid_balance and valid_risk else 0.0
+        expected_profit = risk_amount * rr_multiple if valid_rr else 0.0
         required_volume = None
         position_size = None
         actual_risk = None
-        sizing_status = "MISSING_CONTRACT_SPECS"
-        if contract_size and contract_size > 0 and stop_distance > 0:
+        sized_expected_profit = None
+        if not valid_balance:
+            sizing_status = "INVALID_ACCOUNT_BALANCE"
+        elif not valid_risk:
+            sizing_status = "INVALID_RISK_PERCENTAGE"
+        elif not valid_rr:
+            sizing_status = "INVALID_RR_MULTIPLE"
+        elif stop_distance <= 0:
+            sizing_status = "INVALID_STOP_DISTANCE"
+        elif str(config.SIMULATION_ACCOUNT_CURRENCY).upper() != "USD":
+            sizing_status = "ACCOUNT_CURRENCY_CONVERSION_UNAVAILABLE"
+        elif contract_size is not None and (not math.isfinite(contract_size) or contract_size <= 0):
+            sizing_status = "INVALID_CONTRACT_SIZE"
+        elif contract_size is None:
+            sizing_status = "MISSING_CONTRACT_SPECS"
+        elif contract_size > 0:
             risk_per_lot = stop_distance * contract_size
             required_volume = risk_amount / risk_per_lot
             if broker_min_volume is None or broker_volume_step is None:
                 sizing_status = "MISSING_BROKER_VOLUME_RULES"
-            elif broker_min_volume <= 0 or broker_volume_step <= 0:
+            elif (not math.isfinite(broker_min_volume) or not math.isfinite(broker_volume_step)
+                  or broker_min_volume <= 0 or broker_volume_step <= 0
+                  or (broker_max_volume is not None and (
+                      not math.isfinite(broker_max_volume) or broker_max_volume < broker_min_volume
+                  ))):
                 sizing_status = "INVALID_BROKER_VOLUME_RULES"
             elif required_volume < broker_min_volume:
                 sizing_status = "BELOW_BROKER_MINIMUM"
             else:
-                volume_steps = int((required_volume + 1e-12) / broker_volume_step)
-                position_size = volume_steps * broker_volume_step
-                if broker_max_volume is not None:
-                    position_size = min(position_size, broker_max_volume)
+                volume_cap = min(required_volume, broker_max_volume) if broker_max_volume is not None else required_volume
+                volume_steps = math.floor((volume_cap - broker_min_volume + 1e-12) / broker_volume_step)
+                position_size = broker_min_volume + volume_steps * broker_volume_step
                 if position_size < broker_min_volume:
                     position_size = None
                     sizing_status = "BELOW_BROKER_MINIMUM"
@@ -58,15 +82,31 @@ class RiskManager:
                     if sizing_status != "OK":
                         position_size = None
                         actual_risk = None
-        elif stop_distance <= 0:
-            sizing_status = "INVALID_STOP_DISTANCE"
+                    else:
+                        sized_expected_profit = actual_risk * rr_multiple
+
+        if sizing_status == "OK":
+            risk_sizing_feasibility = "WITHIN_CONFIGURED_RISK"
+            # Margin and symbol settings are not independently verified by this scanner.
+            account_feasibility = "UNKNOWN"
+        elif sizing_status in {
+            "MISSING_CONTRACT_SPECS", "MISSING_BROKER_VOLUME_RULES",
+            "ACCOUNT_CURRENCY_CONVERSION_UNAVAILABLE",
+        }:
+            risk_sizing_feasibility = "UNKNOWN"
+            account_feasibility = "UNKNOWN"
+        else:
+            risk_sizing_feasibility = "INFEASIBLE"
+            account_feasibility = "INFEASIBLE"
 
         return {
-            "account_balance": float(account_balance),
+            "account_balance": account_balance,
+            "currency": config.SIMULATION_ACCOUNT_CURRENCY,
             "risk_pct": float(risk_pct),
             "risk_amount": round(risk_amount, 4),
             "rr_multiple": float(rr_multiple),
             "expected_profit": round(expected_profit, 4),
+            "sized_expected_profit": round(sized_expected_profit, 4) if sized_expected_profit is not None else None,
             "stop_distance": round(stop_distance, 5),
             "contract_size": contract_size,
             "required_volume": round(required_volume, 8) if required_volume is not None else None,
@@ -76,6 +116,14 @@ class RiskManager:
             "broker_volume_step": broker_volume_step,
             "broker_max_volume": broker_max_volume,
             "sizing_status": sizing_status,
+            "risk_sizing_feasibility": risk_sizing_feasibility,
+            "account_feasibility": account_feasibility,
+            "symbol_specs_verification": (
+                "user_configured_unverified"
+                if contract_size is not None and broker_min_volume is not None and broker_volume_step is not None
+                else "unavailable"
+            ),
+            "margin_status": "unavailable",
         }
 
     def apply_trade_result(self, account_balance, trade_plan, outcome, rr_achieved=0.0):

@@ -1,276 +1,154 @@
-# SOLID XAU/USD SCAN AND ALERT RICHSCHEME 001
+# SOLID XAU/USD Scanner
 
-A Python scanner for analyzing XAU/USD market data and producing structured signals for a person to review. The scanner is a decision-support tool, not an automated trading bot: it does not place, modify, or close orders. Trade execution remains manual.
+SOLID is a Python market-scanning and trade-review workspace for XAU/USD. It reads market data, analyzes H4/H1/M15 structure with M5 entry confirmation, records conditional setup ideas in SQLite, and presents them in a Streamlit dashboard. It is intended for manual decision support. It does not submit, modify, or close broker orders, and it cannot confirm that a setup was filled.
 
-## Current Scope
+## What runs today
 
-- Instrument: XAU/USD (`XAUUSD`) only
-- Market data: BiQuote REST API at `https://biquote.io/api`
-- Timeframes: H4 higher-timeframe context, H1 structure, and M15 setup/entry analysis
-- Output: local console/log signal summary, with Telegram as an optional alert channel
-- Strategy: retain and validate the existing analysis and scoring logic where practical
-- Intent: identify potential upcoming setups where supported by the strategy, with a planned entry and the conditions that would support the scenario
+The live scanner in `main.py` repeatedly fetches XAUUSD candles, validates their timestamps and OHLC values, archives them, analyzes the market, and logs a summary. H4 supplies directional bias, H1 supplies confirmation and structure, M15 forms a setup candidate, and a verified completed M5 candle must break the preceding M5 candle's high or low with sufficient body and valid stop geometry before the scanner issues an actionable entry alert. Missing, stale, unverified, or unconfirmed M5 data prevents setup persistence and entry alerts. BiQuote supports M5. The optional Deriv demo connector supports only M15, H1, and H4, so selecting it leaves the scanner safely paused for missing M5 data.
 
-Signals are strategy-based potential setups or conditional scenarios, not certain predictions. The goal is to give the user a plan before the expected price movement occurs where the available market structure and strategy allow it. A signal should communicate its direction, planned entry, Stop Loss, Take Profit, and supporting conditions/structure, along with risk/reward information when available.
+The baseline analysis uses H4 EMA bias; H1 swings, breaks of structure, and liquidity sweeps; and M15 fair value gaps, retests, rejection candles, and entry/stop/target geometry. The phone channel sends only `ENTRY SIGNAL CONFIRMED`, and only for a candidate passing H4, H1, M15, and the verified completed-M5 breakout. The alert includes direction, levels, risk/reward, and rationale. Developing setups and lifecycle events remain local diagnostics. These describe hypothetical entry conditions, not broker orders. Invalid level geometry is rejected.
 
-Where supported by the strategy, the signal should distinguish among:
+The scanner checks candle quality and age, a persistent simulation-account risk gate, duplicate setup identity, optional economic-news blackout, and alert cooldowns. It stores accepted setups, chart paths, risk-sizing scenarios, optional AI review, and notification status. Undelivered qualified entries are retried after a five-minute backoff while still inside the setup age window. Startup, market-data, risk, news, M5-wait, and lifecycle messages are written to local logs rather than the phone channel. A price touching an entry is not evidence of a broker fill.
 
-- **BUY LIMIT**: anticipate a bullish reaction at a planned lower entry level.
-- **SELL LIMIT**: anticipate a bearish reaction at a planned higher entry level.
-- **BUY STOP**: anticipate bullish continuation after a specified breakout level.
-- **SELL STOP**: anticipate bearish continuation after a specified breakdown level.
-- **MARKET/IMMEDIATE**: identify a valid current-entry setup explicitly; do not use this type merely because price has already moved.
+## Components
 
-These labels describe the intended setup, not broker orders. The scanner must never place pending orders or market orders. The user decides manually whether and how to execute a signal on their broker.
+| Area | What it does |
+| --- | --- |
+| `main.py` | Live scan loop, data-quality checks, analysis, deduplication, risk gating, persistence, and notifications |
+| `scanner/data_provider.py` | Selects the configured read-only provider |
+| `scanner/mt5_connector.py` | Legacy filename; currently the BiQuote REST OHLC and quote adapter. It does not connect to MetaTrader 5. |
+| `scanner/deriv_connector.py` | Optional Deriv demo read-only market-data/account connector |
+| `scanner/market_analyzer.py`, `scanner/scoring_engine.py` | Multi-timeframe setup analysis, levels, and scoring |
+| `scanner/m5_strategy.py` | Closed-candle M5 trigger that qualifies and prices actionable entries |
+| `scanner/setup_state.py`, `dashboard/signal_lifecycle.py` | Duplicate identity and observed setup lifecycle rules |
+| `scanner/ai_advisor.py` | Optional local Ollama review, schema-validated and advisory only |
+| `scanner/news_filter.py` | Optional economic-calendar blackout filter |
+| `risk/risk_manager.py` | Simulation risk checks and hypothetical sizing plan |
+| `database/db_manager.py` | SQLite storage for setups, candles, risk/account snapshots, decisions, modeled outcomes, and journal records |
+| `dashboard/app.py` | Streamlit dashboard, setup ledger, journal, analytics, daily review, and risk status |
+| `alerts/notifier.py`, `alerts/telegram_bot.py` | ntfy/Discord transport and alert formatting |
+| `scanner/oanda_connector.py` | Read-only OANDA practice candle fetch and history archive utility; not the live scanner's selected provider |
+| `scanner/csv_market_data.py`, `scanner/import_market_csv.py` | Normalize and import broker-exported OHLC CSV data into source-separated candle storage |
+| `scanner/signal_replay.py` | Historical, chronological signal replay and approximate OHLC outcome analysis |
 
-BiQuote is the current provider, not a permanent dependency of the analysis layer. The connector boundary should allow another provider to be substituted without rewriting the strategy. XAU/USD is an OTC/CFD instrument; feeds and quoted prices vary by broker. BiQuote prices must not be assumed to match Deriv, HFM, or another broker.
-
-## Architecture
-
-```text
-BiQuote Market Data
-	↓
-Data Normalization
-	↓
-H4 Analysis
-	↓
-H1 Analysis
-	↓
-M15 Analysis
-	↓
-Existing Strategy / Scoring
-	↓
-Signal Generation
-	↓
-Entry / SL / TP / Risk-Reward
-	↓
-Structured Signal Output
-	↓
-Optional Telegram Alert
-	↓
-Manual Trade Execution by User
-```
-
-The current connector returns pandas DataFrames with `Open`, `High`, `Low`, `Close`, and `Volume` columns. The provider's `tickVolume` is used for `Volume` because its `volume` field is zero. The scanner requests 200 H4 bars, 200 H1 bars, and 100 M15 bars per scan. The existing strategy uses H4 EMA bias, H1 swing structure/BOS and liquidity sweeps, and M15 FVG, retest, rejection-candle, entry, and stop/target calculations. Scoring grades setups against the existing confluence rules.
-
-Signal generation describes potential upcoming setups rather than only summarizing past price movement. A BUY/SELL LIMIT is generated only for a direction-aligned active FVG that has not been retested since formation. A BUY/SELL STOP is generated only ahead of an unbroken H1 swing level. MARKET/IMMEDIATE requires an M15 retest with a directional rejection candle. Signals include the entry condition, entry, SL, TP, risk/reward, and supporting conditions when available. These are strategy-based scenarios, not guarantees; neither local output nor Telegram submits orders.
-
-Generated signal types are stored with setup history and shown in the dashboard. Existing databases are migrated by adding the nullable `signal_type` column; older setup rows without a recorded type remain marked as not recorded.
-
-## Repository Layout
-
-```text
-main.py                     Scanner loop, multi-timeframe fetch and signal output
-config.py                   Environment and scanner configuration
-scanner/
-  mt5_connector.py          Legacy module name; currently provides BiQuote REST data
-	market_analyzer.py        Multi-timeframe strategy, setup classification and levels
-	oanda_connector.py        Read-only OANDA practice candles and history archival
-  scoring_engine.py         Setup scoring and grade classification
-  chart_generator.py        Signal chart generation
-  news_filter.py            Existing economic-calendar filter
-alerts/telegram_bot.py      Optional Telegram message/photo output
-risk/risk_manager.py        Existing risk checks
-database/db_manager.py      SQLite persistence and setup-type migration
-dashboard/app.py            Existing Streamlit dashboard
-scanner/csv_market_data.py  Broker OHLC CSV normalization and import
-scanner/import_market_csv.py CSV import command-line entry point
-scanner/signal_replay.py     Historical signal replay and OHLC outcome estimates
-tests/
-	test_oanda_connector.py   OANDA practice candle request and safety tests
-	test_csv_market_data.py   CSV parsing, validation, and persistence tests
-	test_biquote_connector.py Provider bar ordering/normalization tests
-	test_signal_generation.py Signal classification and level tests
-	test_setup_signal_type.py SQLite persistence and migration tests
-requirements.txt            Python dependencies; no MetaTrader5 package
-```
-
-The dashboard, database, risk, and news modules remain in the repository from the earlier application shape. The active development target is the XAU/USD scanner and its signal-validation path; this README does not imply that every retained module has been revalidated for the current data-only workflow.
-
-## Development Status
-
-- The MetaTrader5 Python dependency and runtime connection have been removed. The connector's old filename and unused MT5 credential settings remain as cleanup items; they do not provide an MT5 market-data connection.
-- BiQuote is configured as the current REST data source. The connector has an XAUUSD connectivity check and maps H4, H1, and M15 to the provider intervals `4h`, `1h`, and `15m`.
-- BiQuote returns bars newest-first; the connector now sorts normalized bars oldest-to-newest so the analyzer's final row is the latest candle. A connector regression test covers this behavior.
-- A read-only live validation on 2026-09-29 retrieved H4, H1, and M15 bars with numeric, internally consistent OHLC values and nonzero normalized tick volume. The analyzer produced a bearish MARKET/IMMEDIATE scenario (score 10/A+) from an M15 retest and shooting-star rejection, with sell-side Entry/SL/TP ordering. This is one observed scan, not evidence of predictive performance or broad strategy validation.
-- BiQuote confirmed that its endpoint is a rolling window, not a historical archive: XAUUSD provides up to 168 closed H1 candles plus the open candle, 180 H4 candles, and 500 D1 candles. `from`/`to` only filter within those windows; older candles are not retained and there is no separate history endpoint or export. The connector caps inclusive responses at the requested maximum and keeps the newest bars. This feed is suitable for live scanning, but not multi-year H1/H4 backtesting. Build a forward archive by polling and storing candles, and use broker MT5 history, Dukascopy tick data, or the existing OANDA archive for deeper research.
-- Each live scan now stores the fetched H4, H1, and M15 candles in the local `market_bars` table under source `BIQUOTE`, separate from OANDA and broker imports. Polling follows `SCAN_INTERVAL`; repeated bars are deduplicated by source/symbol/timeframe/open-time, while changed values at an existing timestamp update the row so the current forming candle stays current. Archive write failures are logged without stopping signal analysis.
-- The read-only OANDA practice connector successfully authenticated and retrieved `XAU_USD` midpoint candles for H4, H1, and M15. It excludes incomplete candles, archives rows under `OANDA-PRACTICE`, and has no order-submission calls.
-- OANDA history was backfilled in paginated requests. Current archive totals are 4,999 H4, 19,117 H1, and 76,426 M15 candles. All three start at 2023-07-06 17:00 UTC; timestamps are unique and OHLC integrity checks found zero invalid candles. Coverage and archive validation reflect the data retrieved on 2026-09-29.
-- Yahoo Finance's `XAUUSD=X` chart requests returned no data; its `GC=F` symbol returned COMEX gold-futures bars, which are not equivalent to broker XAU/USD CFD prices. Dukascopy's direct history host timed out from this environment.
-- `tickVolume` is normalized as the output `Volume` column.
-- The analyzer now classifies potential LIMIT setups from unretested active FVGs, STOP setups ahead of unbroken H1 swing levels, and MARKET/IMMEDIATE setups only after an M15 retest and directional rejection. It rejects levels whose SL/TP geometry is invalid.
-- Signal type is persisted in SQLite and displayed on the Active Setups page. Existing databases are migrated without deleting setup history; older records show "Not recorded".
-- Broker-exported OHLC CSV files can be normalized, stored in a separate `market_bars` table, and loaded back as pandas OHLCV DataFrames. Rows are keyed by source, symbol, timeframe, and UTC candle timestamp; re-importing is idempotent, and broker feeds remain distinguishable from BiQuote.
-- Unit tests cover OANDA practice request construction, backward pagination and incomplete-candle filtering, CSV parsing and timezone conversion, candle validation, idempotent/source-separated persistence, chronological BiQuote normalization, signal classification, replay timing/outcomes, and setup-type migration.
-- `scanner.signal_replay` replays using only closed H4/H1/M15 candles and estimates entry fills, TP1/SL outcomes, holding time, and R-multiples from later M15 OHLC bars. Same-bar SL/TP collisions count as SL; pending entries may remain unfilled, and outcomes unresolved at the holding limit are reported separately. A one-week OANDA sample (2026-09-23 through 2026-09-29) produced 317 signals across 418 available M15 decisions: 66 reached TP1, 55 reached SL, 127 were unfilled, and 69 remained unresolved. The resolved-only win rate was 54.5% with mean +0.64R. This short sample is a pipeline check, not evidence of strategy profitability; spread, slippage, funding, and position-management rules are not modeled.
-- Telegram code is present as an output layer. Missing credentials make sends no-ops, and Telegram request errors are caught; successful Telegram delivery has not been established by the local scanner log. Local console/log output is generated independently of Telegram.
-- Full-history replay and robust historical performance validation remain outstanding; the current OHLC outcome evaluator is an initial research tool, not a broker-execution simulator.
+The database is created at `DB_PATH` (default `trading_scanner.db`). It is migrated in place as fields are added. Keep the database and generated artifacts backed up if you need their history.
 
 ## Setup
 
-Python 3.10 or newer is required. The scanner does not require Windows or a MetaTrader 5 terminal. Install the dependencies in a virtual environment:
+Python 3.10 or newer is recommended.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-On Windows, activate the environment with `.venv\Scripts\activate` instead. Create a local `.env` file for optional settings:
+Edit `.env` for your environment. Do not commit credentials. The tracked default is `MARKET_DATA_PROVIDER=BIQUOTE`. The scanner also supports `DERIV_DEMO`; it requires the corresponding Deriv API token, app ID, and demo account configuration. The active provider is selected at process start. OANDA credentials are used by the separate OANDA archive utility, not by the live scanner selector.
 
-```env
-BIQUOTE_BASE_URL=https://biquote.io/api
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-OANDA_API_TOKEN=
-MARKET_DATA_PROVIDER=BIQUOTE
-DERIV_API_TOKEN=
-DERIV_APP_ID=
-DERIV_DEMO_ACCOUNT_ID=
-```
+The repository's local `.env` is intentionally untracked and may differ from `.env.example` or the code defaults. Check `MARKET_DATA_PROVIDER` and other local settings before running this workspace.
 
-Telegram credentials are optional during development. If enabled, keep the bot token and chat ID in `.env`; never hardcode credentials in source. The repository ignores `.env`; do not commit it.
+## Running
 
-### Optional Deriv Demo Read-Only Check
-
-The Deriv connector is opt-in and read-only. It uses Deriv's documented account-list and one-time-password flow to select a **demo** Options account, then reads account balance and Gold candles. It includes no order, buy, sell, or contract execution calls. Create a Deriv Personal Access Token with the required account read/trade scope and use your Deriv app ID; store both only in the ignored local `.env` file. Never paste tokens into chat or commit them. `DERIV_DEMO_ACCOUNT_ID` is optional; if omitted, the first demo account returned for that token is selected. Real accounts are rejected.
-
-To check the credentials and read sample H4/H1/M15 candles without changing the live scanner's feed:
+Start the scanner loop:
 
 ```bash
-python -m scanner.deriv_connector --count 5
-```
-
-To opt the scanner into Deriv demo candles and balance checks, set:
-
-```env
-MARKET_DATA_PROVIDER=DERIV_DEMO
-```
-
-The default remains `BIQUOTE`. Deriv and BiQuote XAU/USD quotes may differ; setups generated from one feed must not be assumed to match another broker's executable prices. The Deriv connector should be validated with your account before switching the scanner provider.
-
-### Simulation Risk Account
-
-The scanner keeps the selected provider's broker/demo balance separate from strategy capital. The broker balance is retained as connectivity/account metadata; active drawdown checks and journal P/L use a persistent simulation account seeded from `SIMULATION_ACCOUNT_BALANCE` (default `$10`). The default `MAX_RISK_PER_TRADE` is `2%`, and `SIMULATION_RR_MULTIPLE` is `2.0`. Changing the configured starting balance rebases current simulation equity by preserving realized dollar P/L and resets the drawdown high-water baseline; existing trade history remains available.
-
-Position size is calculated as `risk amount / (entry-to-stop price distance × XAUUSD contract size)`, then rounded down to the broker's volume step. Configure `XAUUSD_CONTRACT_SIZE`, `BROKER_MIN_VOLUME`, `BROKER_VOLUME_STEP`, and optionally `BROKER_MAX_VOLUME` only from the exact CFD symbol specification for the broker you intend to model. Missing specifications or a required size below broker minimum are recorded as non-executable; the scanner never rounds volume up and never raises risk to fit a minimum lot.
-
-The current Deriv connector is a read-only Options account/candle connector. It provides no CFD contract size or minimum-volume/step specification and does not place orders. Therefore it can supply broker connectivity metadata, but exact XAUUSD CFD position sizing remains unavailable while using Deriv unless valid CFD specifications are explicitly configured for a separate broker model. A `$10` account at `2%` risk still has `$0.20` planned risk and `$0.40` planned reward at `2R`; whether that risk can be represented by an executable volume depends on those specifications.
-
-Start the scanner:
-
-```bash
+source .venv/bin/activate
 python main.py
 ```
 
-The scanner checks BiQuote connectivity at startup, then polls and archives H4/H1/M15 candles each scan before logging analysis and signal summaries to the console and `scanner.log`. A data-source connection failure prevents scanning; an archive write failure is logged but does not prevent analysis, and Telegram unavailability must not prevent local signal output. The existing dashboard can be started separately with `streamlit run dashboard/app.py`, but it is not required for scanning.
-
-### Archive OANDA Practice Candles
-
-The optional OANDA connector is separate from the live BiQuote scanner. It uses the OANDA practice API and only requests midpoint XAU/USD candles; it contains no order-submission calls. API access requires an eligible OANDA v20 practice account. Add a newly generated practice API token to local `.env` as `OANDA_API_TOKEN`; never paste it into chat or commit `.env`. Any token previously shared in chat should be revoked and replaced.
-
-Fetch and archive up to 5,000 complete candles per timeframe:
+Start the dashboard in a second terminal:
 
 ```bash
-python -m scanner.oanda_connector --count 5000
+source .venv/bin/activate
+streamlit run dashboard/app.py
 ```
 
-The command requests H4, H1, and M15, excludes each currently open candle, and stores data under the `OANDA-PRACTICE` source label. It does not switch the scanner away from BiQuote. To extend history backward to a chosen UTC date, use paginated requests with `--from`:
+The dashboard includes Dashboard, Economic Calendar, Active Setups, Signal Ledger, Trade Journal, Analytics, Daily Review, and Risk Status pages. The Signal Ledger separates a hypothetical candle-based outcome from the user's decision and any separately journaled result. Paper journal entries and manually reported trades are distinguished; manually reported trades are user supplied and are not independently verified.
+
+## Configuration
+
+Common settings are in `.env.example` and `config.py`:
+
+| Setting | Purpose |
+| --- | --- |
+| `MARKET_DATA_PROVIDER` | `BIQUOTE` (default) or `DERIV_DEMO` |
+| `SCAN_INTERVAL` | Seconds between live scans; default 60 |
+| `MAX_SETUP_AGE_MINUTES` | Setup deduplication/lifecycle age window; default 60 |
+| `MAX_MARKET_BAR_AGE_MINUTES` | Extra permitted candle age beyond its timeframe; default 30 |
+| `DB_PATH` | SQLite file location |
+| `NOTIFICATION_PROVIDER` | `NTFY` (default) or `DISCORD`; configure the matching topic or webhook |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Direct Telegram adapter credentials; the live scanner notifier uses `NOTIFICATION_PROVIDER` (ntfy or Discord) |
+| `NEWS_FILTER_ENABLED` | Enable the calendar blackout check; default true |
+| `AI_ADVISOR_ENABLED` | Enable local Ollama review; default false |
+| `SIMULATION_ACCOUNT_BALANCE`, `SIMULATION_ACCOUNT_CURRENCY` | Starting simulation-account baseline |
+| `MAX_RISK_PER_TRADE`, `MAX_DAILY_DRAWDOWN`, `MAX_WEEKLY_DRAWDOWN`, `MAX_CONSECUTIVE_LOSSES` | Simulation risk thresholds |
+| `XAUUSD_CONTRACT_SIZE`, `BROKER_MIN_VOLUME`, `BROKER_VOLUME_STEP`, `BROKER_MAX_VOLUME` | Optional user-entered sizing assumptions; verify them against the intended broker |
+
+Provider account balance/equity, when available, is stored as account metadata. Scanner drawdown checks use the persistent simulation account. Position size and account feasibility can remain unknown because contract rules, margin, conversion, and broker-specific specifications are not necessarily available or verified.
+
+Signal notifications use the configured ntfy topic or Discord webhook. Confirmed entries receive high ntfy priority. Local logging and persistence remain useful when delivery fails; the scanner records the failure and retries an eligible confirmed entry after five minutes. A configured endpoint and a subscribed phone client are still required for actual phone delivery.
+
+## Candle archive and research tools
+
+Each live scan stores its candles in `market_bars`, keyed by source, symbol, timeframe, and UTC open time. Repeated timestamps update existing rows, which allows the currently forming candle to be refreshed. Broker CSV imports use a source label so feeds remain distinguishable:
 
 ```bash
-python -m scanner.oanda_connector --timeframes H1 M15 --count 5000 \
-	--from 2023-07-06T17:00:00Z
+python -m scanner.import_market_csv path/to/export.csv \
+  --symbol XAUUSD --timeframe M15 --source MY_BROKER \
+  --timezone Europe/Athens
 ```
 
-An optional `--to` timestamp bounds the end of the requested range. OANDA candles are a separate feed and may differ from BiQuote or another broker's XAU/USD CFD.
+Supply `--timezone` when CSV timestamps do not include a UTC offset. Omit it for timestamps that already specify a timezone. Supported CSVs need timestamp (or date and time) plus open, high, low, and close columns; volume is optional.
 
-### Import Broker History from CSV
-
-After exporting OHLC candles from a broker, import them without replacing the live BiQuote feed:
+Fetch recent complete OANDA practice candles or backfill a date range (requires `OANDA_API_TOKEN`):
 
 ```bash
-python -m scanner.import_market_csv /path/to/export.csv \
-	--symbol XAUUSD --timeframe H1 --source HFM --timezone Europe/Athens
+python -m scanner.oanda_connector --timeframes H4 H1 M15 --count 200
+python -m scanner.oanda_connector --timeframes M15 --from 2023-07-06T00:00:00Z --to 2026-09-29T00:00:00Z
 ```
 
-Set `--source` to the broker/feed name and `--timezone` to the export's timezone when timestamps have no explicit UTC offset. The importer accepts common `Date` + `Time` or timestamp columns and OHLC headers, including MT-style semicolon exports. It rejects invalid candle ranges, normalizes timestamps to UTC, and stores the data separately from live scanner bars. We need a sample of your actual broker export to confirm its headers, timestamp convention, and volume fields before claiming compatibility with that exact export.
+The OANDA adapter only requests candles and stores them under `OANDA-PRACTICE`; it has no order-submission path. Historical replay reads source-separated archived candles. See `reports/oanda_full_history_replay_2023-2026.md`, its CSV, and metadata for the recorded OANDA replay and its assumptions.
 
-### Replay Archived Signals
-
-Replay archived OANDA practice candles and evaluate each signal against subsequent M15 bars, with a default maximum holding period of 96 bars (24 hours):
+Replay the archived H4/H1/M15 data into a CSV (the source must already exist in the local database):
 
 ```bash
-python -m scanner.signal_replay --source OANDA-PRACTICE --symbol XAU_USD \
-	--from 2026-09-23T00:00:00Z --to 2026-09-30T00:00:00Z \
-	--holding-bars 96 --output signal_replay.csv
+python -m scanner.signal_replay \
+  --source OANDA-PRACTICE --symbol XAU_USD \
+  --from 2023-07-06T00:00:00Z --to 2026-09-29T00:00:00Z \
+  --output signal_replay.csv
 ```
 
-The report distinguishes unfilled entries, unresolved trades, stop losses, and TP1 exits. Because candles contain no intrabar path, a bar that reaches both SL and TP1 is conservatively counted as an SL. The report does not include spread, slippage, commissions, or overlapping-position constraints.
+BiQuote's OHLC endpoint is a rolling window rather than a deep historical archive. Repeated live polling can build a forward local archive, but the available feed history is not by itself a multi-year backtest dataset. OANDA practice candles, broker CSVs, and BiQuote candles have different feed provenance and should not be treated as interchangeable prices.
 
-## Roadmap
+## Research limits
 
-### Stage 1 — Market Data (Implemented; reliability validation ongoing)
+The stored full-history replay is an exploratory retrospective study, not evidence of profitability or a clean out-of-sample result. Its outcomes are estimated from OHLC candles: pending-entry timing, same-candle stop/target ordering, spread, commission, slippage, swaps, liquidity, margin, and broker execution may differ from real trading. The report documents the sample, filters, and cost sensitivity. A chronological split was added after the report had already been inspected, so it is not an untouched holdout. Forward observation and broker-specific cost assumptions are still needed.
 
-- [x] Remove the MT5 runtime dependency
-- [x] Integrate BiQuote and normalize OHLCV data
-- [x] Verify H4/H1/M15 data retrieval
-- [x] Normalize provider bars to chronological order
-- [x] Cap inclusive provider responses at the requested maximum
-- [x] Confirm documented `from`/`to` range filtering; no offset/page pagination is documented
-- [ ] Continue testing provider reliability and error handling
-- [ ] Confirm deeper XAUUSD H4/H1 history availability with BiQuote and evaluate a comparable free historical source; do not substitute gold futures as an equivalent CFD feed
-- [x] Add a separate OANDA practice candle archive path
-- [x] Verify OANDA practice token access and live candle retrieval without exposing credentials
-- [x] Backfill H1 and M15 to align with the available H4 history
-- [ ] Validate strategy behavior across the expanded OANDA history
-- [x] Persist live BiQuote candles locally so its rolling window builds into a forward archive
+Signal Ledger modeled outcomes are also hypothetical per-setup M15 candle scenarios (configured source, up to four pending bars and a 96-bar horizon). They are independent of portfolio overlap and journal records; they do not model all execution costs or confirm fills. Paper trade records are simulations. Manual trade records are self-reported.
 
-### Stage 2 — Analysis & Signal Generation (In progress)
+## Tests
 
-- [x] Preserve the existing strategy and scoring logic
-- [x] Generate typed potential setups with entry conditions and levels
-- [x] Add unit coverage for supported types, stale setups, and invalid level geometry
-- [x] Complete an initial read-only live validation of H4/H1/M15 analysis and signal output
-- [ ] Repeat validation across representative market conditions
-- [ ] Review Entry, SL, TP, and risk/reward calculations across those examples
+Run the current test suite with:
 
-### Stage 3 — Output (Partially implemented)
+```bash
+.venv/bin/pytest -q
+```
 
-- [x] Include signal type, levels, and conditions in local output
-- [x] Persist and display signal type in setup history
-- [x] Keep Telegram optional and alerts manual-only
-- [ ] Validate Telegram delivery and failure behavior end to end
+The latest full run reported 165 passed and 7 subtests passed. Tests cover connector behavior, candle normalization and persistence, setup generation and lifecycle, replay timing/outcomes, risk/account separation, journal flows, dashboard views, M5 confirmation, and staged notification routing. Passing tests validate code paths, not trading performance, provider uptime, or live phone delivery.
 
-### Stage 4 — Backtesting
+## Safety and operating boundaries
 
-- [x] Add broker CSV candle import and source-separated storage
-- [x] Add chronological signal replay and an initial conservative OHLC outcome estimator
-- [ ] Run replay across the full archived history and investigate runtime/scalability
-- [ ] Validate signal logic and measure results across representative historical conditions
-- Identify weaknesses and edge cases
+- The live connectors are read-only for market data/account metadata. There is no broker order placement, modification, or closure flow.
+- A signal is a conditional strategy scenario, not a prediction or recommendation and not proof of execution.
+- Check the feed, quote, spread, contract details, account feasibility, and current price at the broker you intend to use.
+- AI output is an optional second opinion. It does not qualify signals, change levels, or override risk calculations.
+- Do not commit `.env`, API tokens, bot tokens, or webhook secrets.
 
-### Stage 5 — Finalization
+## Repository notes
 
-- Add and run tests
-- Improve error handling
-- Complete documentation and cleanup
-- Make the final Git commit and push (This is the only commit and push we will have as far as this project is concerned)
-
-## Development Principles
-
-- Keep current scope to XAU/USD and manual trading.
-- Treat signals as potential, conditional strategy scenarios rather than certain predictions.
-- Never place automatic pending orders or market orders; execution decisions remain with the user.
-- Prefer free data sources where practical and keep the market-data interface provider-independent.
-- Preserve useful existing strategy logic and avoid unnecessary rewrites.
-- Test changes before considering them complete.
-- Never expose API keys, Telegram tokens, or other secrets in source code; do not commit `.env`.
-- Keep local scanner output available when optional services such as Telegram are unavailable.
-
-Signals and calculated levels are informational, not broker instructions. Verify prices, contract specifications, and risk at the intended broker before any manual trade. This project makes no performance claims.
+`AGENT_HANDOFF.md` contains detailed implementation history and development handoff notes. `reports/` contains generated project/replay material. Runtime files such as the SQLite database, scanner log, screenshots, and local environment settings are workspace artifacts rather than required source inputs.
 
 ## Author
 
 Yabesi
-

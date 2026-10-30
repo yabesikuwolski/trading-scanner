@@ -1,7 +1,15 @@
+import html
+import logging
+
 import requests
+
 import config
 
+log = logging.getLogger(__name__)
+
 STAGE_HEADERS = {
+    "setup_approaching": "🟡 SETUP APPROACHING",
+    "entry_confirmed": "✅ ENTRY SIGNAL CONFIRMED",
     "setup_developing": "🔍 SETUP DEVELOPING",
     "entry_zone": "⚡ ENTRY ZONE APPROACHING",
     "m5_confirmation": "✅ 5-MIN CONFIRMATION",
@@ -11,22 +19,79 @@ STAGE_HEADERS = {
 }
 
 BIAS_EMOJI = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪"}
+_last_delivery = {"status": "not_attempted", "error": None}
+
+
+def credentials_configured():
+    token = str(config.TELEGRAM_BOT_TOKEN or "").strip()
+    chat_id = str(config.TELEGRAM_CHAT_ID or "").strip()
+    return bool(
+        token and chat_id
+        and token != "your_bot_token_here"
+        and chat_id != "your_chat_id_here"
+    )
+
+
+def get_last_delivery_status():
+    return dict(_last_delivery)
+
+
+def _set_delivery(status, error=None):
+    _last_delivery.update(status=status, error=error)
+
+
+def _redact(value):
+    text = str(value or "")
+    for secret in (config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text[:500]
 
 
 def _post(method, **kwargs):
-    if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
+    if not credentials_configured():
+        _set_delivery("not_configured")
         return False
 
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        r = requests.post(url, timeout=15, **kwargs)
-        if r.status_code >= 400:
-            print(f"[Telegram] {method} HTTP {r.status_code}: {r.text[:200]}")
-            return False
-        return True
-    except Exception as e:
-        print(f"[Telegram] {method} error: {e}")
+        response = requests.post(url, timeout=config.TELEGRAM_TIMEOUT_SECONDS, **kwargs)
+    except requests.Timeout as exc:
+        detail = _redact(exc)
+        _set_delivery("timeout", detail)
+        log.warning("Telegram %s timed out: %s", method, detail)
         return False
+    except requests.RequestException as exc:
+        detail = _redact(exc)
+        _set_delivery("network_error", detail)
+        log.warning("Telegram %s network error: %s", method, detail)
+        return False
+    except Exception as exc:
+        detail = _redact(exc)
+        _set_delivery("network_error", detail)
+        log.warning("Telegram %s failed: %s", method, detail)
+        return False
+
+    if response.status_code >= 400:
+        detail = _redact(response.text)
+        _set_delivery("http_error", f"HTTP {response.status_code}: {detail}")
+        log.warning("Telegram %s returned HTTP %s: %s", method, response.status_code, detail)
+        return False
+
+    try:
+        body = response.json()
+    except (ValueError, AttributeError):
+        _set_delivery("invalid_response", "Telegram returned a non-JSON response")
+        log.warning("Telegram %s returned a non-JSON success response", method)
+        return False
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        detail = _redact(body.get("description") if isinstance(body, dict) else "invalid response")
+        _set_delivery("api_error", detail or "Telegram API rejected the request")
+        log.warning("Telegram %s API error: %s", method, detail or "unspecified")
+        return False
+
+    _set_delivery("success")
+    return True
 
 
 def send_message(text):
@@ -39,102 +104,184 @@ def send_message(text):
 
 def send_photo(photo_path, caption=""):
     try:
-        with open(photo_path, "rb") as f:
+        with open(photo_path, "rb") as photo:
             return _post("sendPhoto", data={
                 "chat_id": config.TELEGRAM_CHAT_ID,
                 "caption": caption[:1024],
                 "parse_mode": "HTML",
-            }, files={"photo": f})
+            }, files={"photo": photo})
     except FileNotFoundError:
-        print(f"[Telegram] photo not found: {photo_path}")
+        _set_delivery("file_not_found", "Chart image was not found")
+        log.warning("Telegram chart image was not found")
         return False
 
 
-def format_alert(symbol, analysis, scoring, alert_stage="setup_developing"):
+def _display(value):
+    return html.escape(str(value if value is not None else "—"), quote=False)
+
+
+def _account_feasibility(simulation_plan):
+    status = str((simulation_plan or {}).get("sizing_status", "UNKNOWN"))
+    account_state = (simulation_plan or {}).get("account_feasibility")
+    if account_state in {"FEASIBLE", "INFEASIBLE", "UNKNOWN"}:
+        return account_state, status
+    if status == "OK":
+        return "UNKNOWN", status
+    if status in {
+        "MISSING_CONTRACT_SPECS", "MISSING_BROKER_VOLUME_RULES",
+        "ACCOUNT_CURRENCY_CONVERSION_UNAVAILABLE",
+    }:
+        return "UNKNOWN", status
+    return "INFEASIBLE", status
+
+
+def format_alert(
+    symbol,
+    analysis,
+    scoring,
+    alert_stage="setup_developing",
+    *,
+    simulation_plan=None,
+    ai_review=None,
+    setup_id=None,
+    setup_age_minutes=0,
+    max_setup_age_minutes=None,
+):
     from scanner.scoring_engine import GRADE_EMOJI
-    bias = analysis.get("bias", "neutral")
-    signal = analysis.get("signal")
-    levels = signal or {}
-    conditions = analysis.get("conditions", [])
-    session = analysis.get("session", "unknown").replace("_", " ").title()
+
+    bias = str(analysis.get("bias", "neutral")).lower()
+    signal = analysis.get("signal") or {}
     grade = scoring.get("grade", "Standard")
     score = scoring.get("score", 0)
-    max_score = scoring.get("max_score", 14)
-    breakdown = scoring.get("breakdown", [])
-
+    max_score = scoring.get("max_score", 14) or 14
+    score = max(0, min(int(score or 0), int(max_score)))
+    progress_bar = "█" * int((score / int(max_score)) * 10) + "░" * (10 - int((score / int(max_score)) * 10))
     header = STAGE_HEADERS.get(alert_stage, "📊 SIGNAL ALERT")
-    grade_emoji = GRADE_EMOJI.get(grade, "📊")
-    bias_emoji = BIAS_EMOJI.get(bias, "⚪")
-
-    progress_filled = int((score / max_score) * 10)
-    progress_bar = "█" * progress_filled + "░" * (10 - progress_filled)
 
     msg = f"{header}\n\n"
-    msg += f"{grade_emoji} <b>{symbol}</b> — <b>{grade} Setup</b>\n"
-    msg += f"Score: [{progress_bar}] {score}/{max_score}\n"
-    msg += f"Bias: {bias_emoji} <b>{bias.upper()}</b> | Session: {session}\n\n"
+    msg += f"{GRADE_EMOJI.get(grade, '📊')} <b>{_display(symbol)} — {_display(grade)} Setup</b>\n"
+    msg += f"Score: [{progress_bar}] {score}/{_display(max_score)}\n"
+    msg += f"Bias: {BIAS_EMOJI.get(bias, '⚪')} <b>{_display(bias.upper())}</b>"
+    if analysis.get("session"):
+        msg += f" | Session: {_display(str(analysis['session']).replace('_', ' ').title())}"
+    msg += "\n"
 
     if signal:
-        msg += f"<b>Potential Signal:</b> {signal['type']} ({signal['direction']})\n"
-        msg += f"<b>Entry condition:</b> {signal['entry_condition']}\n\n"
-
-    signal_conditions = signal.get("conditions", conditions) if signal else conditions
-    if signal_conditions:
-        msg += "<b>Conditions Met:</b>\n"
-        for c in signal_conditions:
-            msg += f"  ✓ {c}\n"
+        direction = signal.get("direction") or ("BUY" if bias == "bullish" else "SELL")
+        signal_type = str(signal.get("type") or "SETUP")
+        signal_label = signal_type if str(direction).upper() in signal_type.upper() else f"{direction} {signal_type}"
+        msg += f"\n<b>{_display(symbol)} — {_display(signal_label)}</b>\n"
+        if signal.get("source_setup_type"):
+            msg += f"M15 setup: {_display(signal['source_setup_type'])}\n"
+        if setup_id:
+            msg += f"Setup ID: <code>{_display(setup_id)}</code>\n"
+        msg += f"Entry: <code>{_display(signal.get('entry'))}</code> | SL: <code>{_display(signal.get('sl'))}</code>\n"
+        msg += f"TP1: <code>{_display(signal.get('tp1'))}</code> | TP2: <code>{_display(signal.get('tp2'))}</code>\n"
+        msg += f"Planned RR: <b>{_display(signal.get('rr'))}R</b>\n"
+        msg += f"Age: {_display(setup_age_minutes)}m"
+        if max_setup_age_minutes is not None:
+            msg += f" / {_display(max_setup_age_minutes)}m expiry"
         msg += "\n"
+        if signal.get("entry_condition"):
+            msg += f"Trigger: {_display(signal.get('entry_condition'))}\n"
 
-    if levels:
-        msg += "<b>Trade Levels:</b>\n"
-        msg += f"  📍 Entry:  <code>{levels.get('entry', '—')}</code>\n"
-        msg += f"  🛑 Stop:   <code>{levels.get('sl', '—')}</code>\n"
-        msg += f"  🎯 TP1:    <code>{levels.get('tp1', '—')}</code>  (2R)\n"
-        msg += f"  🎯 TP2:    <code>{levels.get('tp2', '—')}</code>  (3R)\n\n"
-
-    simulation_plan = levels.get("simulation_plan") or {}
-    if simulation_plan:
-        volume = simulation_plan.get("position_size")
-        volume_text = f"{volume:g}" if volume is not None else "not executable"
-        msg += "<b>Simulation account:</b>\n"
-        msg += (
-            f"  Risk: <code>${simulation_plan['risk_amount']:.2f}</code> | "
-            f"2R reward: <code>${simulation_plan['expected_profit']:.2f}</code>\n"
+    bos = analysis.get("bos") or {}
+    sweep = analysis.get("liquidity_sweep") or {}
+    technical_bits = []
+    if bos.get("type"):
+        technical_bits.append(f"H1 {bos['type']}")
+    if sweep.get("type"):
+        technical_bits.append(f"H1 {sweep['type']}")
+    all_conditions = signal.get("conditions") or analysis.get("conditions") or []
+    m5_conditions = [condition for condition in all_conditions if str(condition).startswith("M5")]
+    other_conditions = [condition for condition in all_conditions if not str(condition).startswith("M5")]
+    conditions = other_conditions[:2] + m5_conditions[:1]
+    if conditions:
+        technical_bits.extend(
+            condition if str(condition).startswith("M5") else f"M15 {condition}"
+            for condition in conditions
         )
+    if technical_bits:
+        msg += "\n<b>Technical basis:</b> " + _display("; ".join(technical_bits)) + "\n"
+
+    plan = simulation_plan or {}
+    if plan:
+        feasibility, sizing_status = _account_feasibility(plan)
+        currency = _display(plan.get("currency", config.SIMULATION_ACCOUNT_CURRENCY))
+        msg += f"\n<b>Simulation suitability: {feasibility}</b> ({_display(sizing_status)})\n"
+        msg += f"Risk budget: <code>{currency} {_display(plan.get('risk_amount'))}</code>\n"
+        size = plan.get("position_size") if feasibility == "UNKNOWN" and sizing_status == "OK" else None
+        if feasibility == "FEASIBLE" and plan.get("position_size") is not None:
+            msg += f"Configured scenario volume: <code>{_display(plan['position_size'])}</code>\n"
+            msg += f"Sized 2R reward: <code>{currency} {_display(plan.get('sized_expected_profit'))}</code>\n"
+            msg += "Uses configured contract rules; confirm them against the intended broker.\n"
+        elif size is not None:
+            msg += f"Calculated volume under unverified rules: <code>{_display(size)}</code>\n"
+            msg += "Account feasibility is unknown; margin and broker settings are not verified.\n"
+        elif feasibility == "UNKNOWN":
+            msg += "Broker size cannot be verified; no executable volume shown.\n"
+        else:
+            msg += "Proposed size is not suitable at this risk budget; do not treat this as approval.\n"
+
+    review = ai_review or {"status": "disabled"}
+    ai_status = review.get("status", "disabled")
+    if ai_status == "available":
         msg += (
-            f"  Volume: <code>{volume_text}</code> | "
-            f"Sizing: <code>{simulation_plan['sizing_status']}</code>\n\n"
+            f"\n<b>AI advisory:</b> {_display(review.get('decision'))} · "
+            f"{_display(review.get('quality_score'))}/100 · {_display(review.get('confidence'))}\n"
         )
+        if review.get("summary"):
+            msg += f"{_display(str(review['summary'])[:180])}\n"
+    else:
+        status_labels = {
+            "disabled": "disabled",
+            "unavailable": "unavailable",
+            "invalid_response": "invalid response",
+        }
+        msg += f"\nAI advisory: {_display(status_labels.get(ai_status, 'not reviewed'))}\n"
 
-    msg += "<i>Conditional strategy scenario only. No order is placed; manual decision required.</i>"
-    return msg
+    msg += "\n<i>Manual decision support only. No order or broker fill is confirmed.</i>"
+    if len(msg) <= 1000:
+        return msg
+    footer = "<i>Manual decision support only. No order or broker fill is confirmed.</i>"
+    body = msg.rsplit("\n<i>", 1)[0]
+    return body[:900].rstrip() + "…\n\n" + footer
 
 
-def send_alert(symbol, analysis, scoring, chart_path=None, alert_stage="setup_developing"):
-    msg = format_alert(symbol, analysis, scoring, alert_stage)
-    if chart_path:
-        return send_photo(chart_path, caption=msg)
-    return send_message(msg)
+def send_alert(
+    symbol,
+    analysis,
+    scoring,
+    chart_path=None,
+    alert_stage="setup_developing",
+    *,
+    simulation_plan=None,
+    ai_review=None,
+    setup_id=None,
+    setup_age_minutes=0,
+    max_setup_age_minutes=None,
+):
+    # Telegram is a retired notification route. The scanner uses
+    # alerts.notifier.send_alert, which validates a completed M5 trigger,
+    # aligned H4/H1 bias, signal levels, and the configured provider before
+    # dispatch. Keep this legacy API local-only so it cannot bypass that gate.
+    log.info("Legacy Telegram signal dispatch suppressed; use the validated notifier")
+    return False
+
+
+def send_lifecycle_update(setup, lifecycle):
+    state = str(lifecycle.get("state") or "").upper()
+    if state not in {"ENTRY TOUCHED", "STALE", "INVALIDATED", "NEWS BLOCKED", "PRICE UNKNOWN"}:
+        return False
+    log.info("Lifecycle state retained locally; phone dispatch suppressed: %s", state)
+    return False
 
 
 def send_risk_alert(violations, warnings=None):
-    msg = "🚨 <b>RISK CONSTITUTION ALERT</b>\n\n"
-    for v in violations:
-        msg += f"❌ {v}\n"
-    if warnings:
-        msg += "\n⚠️ <b>Warnings:</b>\n"
-        for w in warnings:
-            msg += f"  {w}\n"
-    msg += "\n<b>Trading suspended per your constitution rules.</b>"
-    return send_message(msg)
+    log.warning("Risk status retained in local logs; phone dispatch suppressed: %s", violations)
+    return False
 
 
 def send_startup_message(symbols):
-    msg = (
-        "🚀 <b>Trading Scanner Online</b>\n\n"
-        f"Monitoring: <code>{', '.join(symbols)}</code>\n"
-        "Timeframes: H4 bias → H1 structure → M15 entry\n\n"
-        "Strategy: HTF Bias · BOS · Liquidity Sweeps · FVG · Retest · Rejection\n"
-        "Alerts: Standard / A / A+ / 💎 Elite"
-    )
-    return send_message(msg)
+    log.info("Scanner startup retained in local logs; phone dispatch suppressed: %s", symbols)
+    return False

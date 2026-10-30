@@ -175,6 +175,38 @@ def detect_rejection_candle(df, bias):
     return None
 
 
+def generate_trend_signal(df, bias, confirmed_bias, liquidity_sweep, rejection,
+                          ltf_swing_highs, ltf_swing_lows, conditions):
+    """Create only a trend-aligned signal confirmed by a liquidity sweep."""
+    if df.empty or bias not in ("bullish", "bearish") or confirmed_bias != bias:
+        return None
+    if not liquidity_sweep or not rejection:
+        return None
+
+    expected_sweep = "bullish_sweep" if bias == "bullish" else "bearish_sweep"
+    if liquidity_sweep.get("type") != expected_sweep:
+        return None
+
+    entry = float(df["Close"].iloc[-1])
+    sweep_level = float(liquidity_sweep["level"])
+    levels = calculate_entry_levels(
+        df, bias, ltf_swing_highs, ltf_swing_lows, entry_price=entry
+    )
+    zone = f"{bias.upper()}_AGGRESSIVE_ZONE_SWEEP:{sweep_level:.5f}"
+    return {
+        "type": "MARKET/IMMEDIATE",
+        "zone": zone,
+        "direction": "BUY" if bias == "bullish" else "SELL",
+        **levels,
+        "entry_condition": (
+            f"{bias.upper()} trend aligned on H4/H1; "
+            f"{expected_sweep} at {sweep_level:.5f}; "
+            f"M15 {rejection['type']} confirmation"
+        ),
+        "conditions": list(conditions),
+    }
+
+
 def get_session(utc_hour):
     if 8 <= utc_hour < 17:
         if 13 <= utc_hour < 17:
@@ -248,6 +280,7 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
 
     current_price = float(df["Close"].iloc[-1])
     signal_type = None
+    zone = None
     entry = None
     entry_condition = None
 
@@ -255,6 +288,13 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
         signal_type = "MARKET/IMMEDIATE"
         entry = current_price
         entry_condition = "M15 retest confirmed by a directional rejection candle"
+        retest_level = retest.get("level")
+        retest_source = retest.get("fvg_type") or retest.get("type") or "retest"
+        zone = (
+            f"{bias.upper()}_{retest_source}_{float(retest_level):.5f}"
+            if retest_level is not None
+            else f"{bias.upper()}_{retest_source}"
+        )
 
     if signal_type is None:
         for fvg in reversed(fvgs[-6:]):
@@ -264,6 +304,7 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
                 if fvg["top"] < current_price:
                     signal_type = "BUY LIMIT"
                     entry = float(fvg["bottom"])
+                    zone = f"BULLISH_FVG:{float(fvg['bottom']):.5f}:{float(fvg['top']):.5f}"
                     entry_condition = (
                         f"M15 retrace into bullish FVG "
                         f"{fvg['bottom']}-{fvg['top']}"
@@ -273,6 +314,7 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
                 if fvg["bottom"] > current_price:
                     signal_type = "SELL LIMIT"
                     entry = float(fvg["top"])
+                    zone = f"BEARISH_FVG:{float(fvg['bottom']):.5f}:{float(fvg['top']):.5f}"
                     entry_condition = (
                         f"M15 retrace into bearish FVG "
                         f"{fvg['bottom']}-{fvg['top']}"
@@ -284,12 +326,14 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
         if breakout_level > current_price and breakout_level > mtf_close:
             signal_type = "BUY STOP"
             entry = breakout_level
+            zone = f"H1_SWING_HIGH:{breakout_level:.5f}"
             entry_condition = f"H1 close above swing high {breakout_level}"
     elif signal_type is None and bias == "bearish" and mtf_swing_lows:
         breakdown_level = float(mtf_swing_lows[-1][1])
         if breakdown_level < current_price and breakdown_level < mtf_close:
             signal_type = "SELL STOP"
             entry = breakdown_level
+            zone = f"H1_SWING_LOW:{breakdown_level:.5f}"
             entry_condition = f"H1 close below swing low {breakdown_level}"
 
     if signal_type is None:
@@ -309,6 +353,7 @@ def generate_signal(df, bias, mtf_swing_highs, mtf_swing_lows,
 
     return {
         "type": signal_type,
+        "zone": zone or signal_type,
         "direction": "BUY" if is_bullish else "SELL",
         **levels,
         "entry_condition": entry_condition,
@@ -320,6 +365,7 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
     result = {
         "symbol": symbol,
         "bias": "neutral",
+        "confirmed_bias": "neutral",
         "bos": None,
         "liquidity_sweep": None,
         "fvgs": [],
@@ -336,6 +382,11 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
     if bias == "neutral":
         return result
 
+    confirmed_bias = get_htf_bias(mtf_df)
+    result["confirmed_bias"] = confirmed_bias
+    if confirmed_bias == bias:
+        result["conditions"].extend(["H4 Trend", "H1 Trend"])
+
     swing_highs_mtf, swing_lows_mtf = detect_swing_points(mtf_df)
 
     bos = detect_bos(mtf_df, swing_highs_mtf, swing_lows_mtf, bias)
@@ -343,6 +394,8 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
 
     sweep = detect_liquidity_sweep(mtf_df, swing_highs_mtf, swing_lows_mtf)
     result["liquidity_sweep"] = sweep
+    if sweep:
+        result["conditions"].append("Liquidity Sweep")
 
     fvgs = detect_fvg(ltf_df)
     result["fvgs"] = fvgs
@@ -361,6 +414,11 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
     if rejection:
         result["conditions"].append("Rejection Candle")
 
+    if sweep and sweep.get("type") == (
+        "bullish_sweep" if bias == "bullish" else "bearish_sweep"
+    ):
+        result["conditions"].append("Aggressive Zone")
+
     analysis_time = as_of or datetime.now(timezone.utc)
     if analysis_time.tzinfo is None:
         analysis_time = analysis_time.replace(tzinfo=timezone.utc)
@@ -369,18 +427,15 @@ def analyze_symbol(htf_df, mtf_df, ltf_df, symbol, as_of=None):
     utc_hour = analysis_time.hour
     result["session"] = get_session(utc_hour)
 
-    signal = generate_signal(
+    signal = generate_trend_signal(
         ltf_df,
         bias,
-        swing_highs_mtf,
-        swing_lows_mtf,
+        confirmed_bias,
+        sweep,
+        rejection,
         ltf_highs,
         ltf_lows,
-        active_fvgs,
-        retest,
-        rejection,
         result["conditions"],
-        float(mtf_df["Close"].iloc[-1]),
     )
     result["signal"] = signal
     if signal:

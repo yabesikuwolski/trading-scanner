@@ -5,6 +5,7 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TIMEOUT_SECONDS = max(1, int(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "15")))
 
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
@@ -28,6 +29,7 @@ DASHBOARD_REFRESH_SECONDS = max(15, min(30, int(os.getenv("DASHBOARD_REFRESH_SEC
 
 MAX_RISK_PER_TRADE = float(os.getenv("MAX_RISK_PER_TRADE", "2.0"))
 SIMULATION_ACCOUNT_BALANCE = float(os.getenv("SIMULATION_ACCOUNT_BALANCE", "10.0"))
+SIMULATION_ACCOUNT_CURRENCY = os.getenv("SIMULATION_ACCOUNT_CURRENCY", "USD").upper()
 SIMULATION_RR_MULTIPLE = float(os.getenv("SIMULATION_RR_MULTIPLE", "2.0"))
 XAUUSD_CONTRACT_SIZE = float(os.getenv("XAUUSD_CONTRACT_SIZE") or "0") or None
 BROKER_MIN_VOLUME = float(os.getenv("BROKER_MIN_VOLUME") or "0") or None
@@ -50,10 +52,22 @@ DB_PATH = os.getenv("DB_PATH", "trading_scanner.db")
 SCREENSHOTS_DIR = "screenshots"
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "60"))
 
+NOTIFICATION_PROVIDER = os.getenv("NOTIFICATION_PROVIDER", "NTFY").upper()
+NTFY_URL = os.getenv("NTFY_URL", "https://ntfy.sh")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+NOTIFICATION_TIMEOUT_SECONDS = max(1, int(os.getenv("NOTIFICATION_TIMEOUT_SECONDS", "10")))
+SLIPPAGE_PRICE = max(0.0, float(os.getenv("SLIPPAGE_PRICE", "0")))
+COMMISSION_R = max(0.0, float(os.getenv("COMMISSION_R", "0")))
+
 # Local AI advisory layer (zero-cost, advisory-only)
 AI_ADVISOR_ENABLED = os.getenv("AI_ADVISOR_ENABLED", "false").lower() == "true"
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+# The previously configured qwen2.5:7b-instruct was not installed locally; llama3.2:3b was present and smoke-tested.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+# Cold-load inference for the installed 3B local model took about 59 seconds;
+# AI is opt-in and synchronous, so allow cold starts while keeping failures bounded.
+OLLAMA_TIMEOUT_SECONDS = max(1, int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "75")))
 
 # News filter
 NEWS_FILTER_ENABLED = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"

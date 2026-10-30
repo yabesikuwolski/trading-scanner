@@ -1,3 +1,5 @@
+import re
+
 SETUP_STATES = {
     "NO_SETUP",
     "SETUP_DETECTED",
@@ -72,6 +74,21 @@ def _entry_gap(previous, current):
         return None
 
 
+def _zones_are_close(previous_zone, current_zone, tolerance):
+    previous_zone = str(previous_zone or "").strip()
+    current_zone = str(current_zone or "").strip()
+    if previous_zone == current_zone:
+        return True
+    number_pattern = r"[-+]?(?:\d+\.?\d*|\.\d+)"
+    previous_numbers = [float(value) for value in re.findall(number_pattern, previous_zone)]
+    current_numbers = [float(value) for value in re.findall(number_pattern, current_zone)]
+    previous_shape = re.sub(number_pattern, "#", previous_zone).lower()
+    current_shape = re.sub(number_pattern, "#", current_zone).lower()
+    if previous_shape != current_shape or len(previous_numbers) != len(current_numbers):
+        return False
+    return all(abs(left - right) <= tolerance for left, right in zip(previous_numbers, current_numbers))
+
+
 def is_same_setup(previous, current, tolerance=0.15):
     if previous is None or current is None:
         return False
@@ -86,7 +103,7 @@ def is_same_setup(previous, current, tolerance=0.15):
 
     previous_zone = str(previous.get("zone") or "").strip()
     current_zone = str(current.get("zone") or "").strip()
-    if previous_zone and current_zone and previous_zone != current_zone:
+    if previous_zone and current_zone and not _zones_are_close(previous_zone, current_zone, tolerance):
         return False
 
     gap = _entry_gap(previous, current)
@@ -112,13 +129,17 @@ def should_start_new_setup(active_setup, candidate, *, same_zone_tolerance=0.15,
     if candidate_direction and active_direction and candidate_direction != active_direction:
         return True
 
-    if state in {"SETUP_DETECTED", "WAITING_CONFIRMATION", "SIGNAL_FIRED", "ACTIVE", "TP1_HIT", "BREAKEVEN", "TP2_HIT"}:
+    if state in {"SETUP_DETECTED", "WAITING_CONFIRMATION", "SIGNAL_FIRED", "ACTIVE", "ENTRY TOUCHED", "TP1_HIT", "BREAKEVEN", "TP2_HIT"}:
+        if (active_setup.get("zone") and candidate.get("zone")
+                and str(active_setup["zone"]).strip() == str(candidate["zone"]).strip()):
+            return False
         if is_same_setup(active_setup, candidate, tolerance=same_zone_tolerance):
             return False
         return True
 
     if state in {"STOPPED_OUT", "INVALIDATED", "COOLDOWN"}:
-        if active_setup.get("zone") and candidate.get("zone") and str(active_setup.get("zone")) != str(candidate.get("zone")):
+        if (active_setup.get("zone") and candidate.get("zone")
+                and not _zones_are_close(active_setup.get("zone"), candidate.get("zone"), same_zone_tolerance)):
             return True
         gap = _entry_gap(active_setup, candidate)
         if gap is not None and gap >= min_price_move:

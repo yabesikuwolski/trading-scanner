@@ -40,6 +40,16 @@ class SignalReplayTests(unittest.TestCase):
 
         self.assertEqual(result.iloc[0]["outcome"], "stop_loss")
         self.assertEqual(result.iloc[0]["r_multiple"], -1.0)
+        self.assertTrue(result.iloc[0]["tp1_reached"])
+        self.assertTrue(result.iloc[0]["stop_reached"])
+        self.assertAlmostEqual(result.iloc[0]["mfe_r"], 2.5)
+        self.assertAlmostEqual(result.iloc[0]["mae_r"], 1.5)
+        self.assertIn("intrabar path unknown", result.iloc[0]["excursion_method"])
+        self.assertTrue(result.iloc[0]["tp1_reached"])
+        self.assertTrue(result.iloc[0]["stop_reached"])
+        self.assertAlmostEqual(result.iloc[0]["mfe_r"], 2.5)
+        self.assertAlmostEqual(result.iloc[0]["mae_r"], 1.5)
+        self.assertIn("intrabar path unknown", result.iloc[0]["excursion_method"])
 
     def test_pending_limit_can_expire_without_a_fill(self):
         signals = pd.DataFrame([{
@@ -59,6 +69,58 @@ class SignalReplayTests(unittest.TestCase):
         self.assertEqual(result.iloc[0]["fill_status"], "unfilled")
         self.assertEqual(result.iloc[0]["outcome"], "unfilled")
         self.assertIsNone(result.iloc[0]["r_multiple"])
+        self.assertIsNone(result.iloc[0]["mfe_r"])
+
+    def test_replay_records_second_target_and_favorable_close_time(self):
+        signals = pd.DataFrame([{
+            "setup_id": "fixture-1",
+            "decision_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+            "signal_type": "MARKET/IMMEDIATE",
+            "direction": "BUY",
+            "entry": 100.0,
+            "sl": 98.0,
+            "tp1": 110.0,
+            "tp2": 112.0,
+        }])
+        index = pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="15min")
+        candles = bars(index)
+        candles.loc[:, "High"] = [103.0, 111.0, 113.0]
+        candles.loc[:, "Low"] = [99.0, 100.0, 100.0]
+        candles.loc[:, "Close"] = [102.0, 109.0, 112.0]
+
+        result = evaluate_signal_outcomes(signals, candles)
+
+        self.assertEqual(result.iloc[0]["fill_time"], index[0])
+        self.assertTrue(result.iloc[0]["tp1_reached"])
+        self.assertTrue(result.iloc[0]["tp2_reached"])
+        self.assertEqual(result.iloc[0]["favorable_close_bars"], 1)
+        self.assertEqual(result.iloc[0]["favorable_close_minutes"], 15)
+        self.assertIsNone(result.iloc[0]["mfe_r"])
+
+    def test_replay_records_second_target_and_favorable_close_time(self):
+        signals = pd.DataFrame([{
+            "setup_id": "fixture-1",
+            "decision_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+            "signal_type": "MARKET/IMMEDIATE",
+            "direction": "BUY",
+            "entry": 100.0,
+            "sl": 98.0,
+            "tp1": 110.0,
+            "tp2": 112.0,
+        }])
+        index = pd.date_range("2024-01-01T00:00:00Z", periods=3, freq="15min")
+        candles = bars(index)
+        candles.loc[:, "High"] = [103.0, 111.0, 113.0]
+        candles.loc[:, "Low"] = [99.0, 100.0, 100.0]
+        candles.loc[:, "Close"] = [102.0, 109.0, 112.0]
+
+        result = evaluate_signal_outcomes(signals, candles)
+
+        self.assertEqual(result.iloc[0]["fill_time"], index[0])
+        self.assertTrue(result.iloc[0]["tp1_reached"])
+        self.assertTrue(result.iloc[0]["tp2_reached"])
+        self.assertEqual(result.iloc[0]["favorable_close_bars"], 1)
+        self.assertEqual(result.iloc[0]["favorable_close_minutes"], 15)
 
     def test_closed_window_excludes_higher_timeframe_bar_until_close(self):
         index = pd.date_range("2026-09-29T10:00:00Z", periods=4, freq="1h")
@@ -108,9 +170,10 @@ class SignalReplayTests(unittest.TestCase):
             start_time="2024-01-10T12:30:00Z",
         )
 
-        self.assertEqual(len(signals), 2)
+        self.assertEqual(len(signals), 1)
         self.assertEqual(signals.iloc[0]["decision_time"], pd.Timestamp("2024-01-10T12:45:00Z"))
         self.assertEqual(signals.attrs["decision_count"], 3)
+        self.assertEqual(signals.attrs["duplicate_suppressed_count"], 1)
         evaluated = evaluate_signal_outcomes(signals, m15_frame)
         self.assertEqual(evaluated.attrs["decision_count"], 3)
         first_call = mock_analyze.call_args_list[0]
@@ -122,6 +185,39 @@ class SignalReplayTests(unittest.TestCase):
         self.assertLessEqual(first_h4.index[-1] + pd.Timedelta(hours=4), decision_time)
         self.assertLessEqual(first_h1.index[-1] + pd.Timedelta(hours=1), decision_time)
         self.assertLessEqual(first_m15.index[-1] + pd.Timedelta(minutes=15), decision_time)
+
+    def test_open_trade_blocks_overlapping_signal_and_cost_is_subtracted(self):
+        signals = pd.DataFrame([
+            {
+                "decision_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+                "signal_type": "MARKET/IMMEDIATE",
+                "direction": "BUY",
+                "entry": 100.0,
+                "sl": 98.0,
+                "tp1": 104.0,
+            },
+            {
+                "decision_time": pd.Timestamp("2024-01-01T00:00:00Z"),
+                "signal_type": "MARKET/IMMEDIATE",
+                "direction": "BUY",
+                "entry": 100.0,
+                "sl": 98.0,
+                "tp1": 104.0,
+            },
+        ])
+        bars_frame = bars(pd.date_range(
+            "2024-01-01T00:00:00Z", periods=3, freq="15min"
+        ))
+        bars_frame.loc[:, "High"] = 105.0
+
+        result = evaluate_signal_outcomes(
+            signals, bars_frame, transaction_cost_r=0.1
+        )
+
+        self.assertEqual(result.iloc[0]["outcome"], "take_profit")
+        self.assertAlmostEqual(result.iloc[0]["gross_r_multiple"], 2.0)
+        self.assertAlmostEqual(result.iloc[0]["r_multiple"], 1.9)
+        self.assertEqual(result.iloc[1]["outcome"], "overlap_blocked")
 
     def test_replay_rejects_naive_candle_indexes(self):
         naive = pd.date_range("2024-01-01", periods=2, freq="15min")

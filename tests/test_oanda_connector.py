@@ -97,10 +97,12 @@ class OandaConnectorTests(unittest.TestCase):
         )
 
     def test_rejects_unsupported_timeframe_and_count(self):
+        session = Mock()
         with self.assertRaises(ValueError):
-            get_bars("M5", token="local-test-token")
+            get_bars("M1", token="local-test-token", session=session)
         with self.assertRaises(ValueError):
-            get_bars("H1", count=5001, token="local-test-token")
+            get_bars("H1", count=5001, token="local-test-token", session=session)
+        session.get.assert_not_called()
 
     def test_missing_token_fails_without_request(self):
         session = Mock()

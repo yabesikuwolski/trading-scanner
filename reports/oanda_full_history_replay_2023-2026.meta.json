@@ -1,0 +1,15 @@
+{
+  "source": "OANDA-PRACTICE",
+  "symbol": "XAU_USD",
+  "period_start": "2023-07-19 05:15:00+00:00",
+  "period_end": "2026-09-29 11:30:00+00:00",
+  "decision_count": 76426,
+  "duplicate_suppressed_count": 28548,
+  "emitted_candidate_count": 21553,
+  "max_holding_bars": 96,
+  "max_pending_bars": 4,
+  "transaction_cost_r": 0.0,
+  "timeframe_bars_closed_before_decision": true,
+  "overlap_policy": "one open or pending position",
+  "intrabar_policy": "M15 OHLC; stop-loss wins same-bar SL/TP1 collisions"
+}

@@ -14,14 +14,19 @@ from database.db_manager import (
     get_daily_stats, get_weekly_stats, get_risk_log,
     get_journal_entries, save_journal_entry, log_trade, close_trade,
     get_latest_market_bar, get_latest_trading_allowed,
-    get_trade_for_setup, update_setup_lifecycle, mark_setup_reviewed,
+    get_trade_for_setup, update_setup_lifecycle, record_setup_decision,
+    get_signal_ledger,
+    record_setup_lifecycle_notification,
     get_simulation_performance, get_saved_broker_account_snapshot,
 )
 from risk.risk_manager import RiskManager
 from scanner.data_provider import get_symbol_info
 from scanner.news_filter import get_upcoming_events, get_next_high_impact, is_news_blackout
 from dashboard.signal_lifecycle import evaluate_setup
+from dashboard.ai_advisory import build_ai_advisory_view
 from dashboard.setup_table import build_active_setups_table
+from alerts.telegram_bot import get_last_delivery_status, send_lifecycle_update
+from scanner.setup_outcome_tracker import refresh_setup_outcomes
 import config
 
 st.set_page_config(
@@ -416,16 +421,17 @@ def render_account_separation():
     broker = get_saved_broker_account_snapshot()
     st.subheader("Simulation Account")
     cols = st.columns(8)
-    cols[0].metric("Starting balance", f"${simulation['starting_balance']:.2f}")
-    cols[1].metric("Current equity", f"${simulation['equity']:.2f}")
-    cols[2].metric("Realized P/L", f"${simulation['realized_pnl']:+.2f}")
+    sim_currency = config.SIMULATION_ACCOUNT_CURRENCY
+    cols[0].metric("Starting balance", f"{sim_currency} {simulation['starting_balance']:.2f}")
+    cols[1].metric("Current equity", f"{sim_currency} {simulation['equity']:.2f}")
+    cols[2].metric("Realized P/L", f"{sim_currency} {simulation['realized_pnl']:+.2f}")
     cols[3].metric("Wins / losses", f"{simulation['wins']} / {simulation['losses']}")
     cols[4].metric("Daily drawdown", f"{simulation['daily_drawdown']:.2f}%")
     cols[5].metric("Weekly drawdown", f"{simulation['weekly_drawdown']:.2f}%")
     cols[6].metric("Max drawdown", f"{simulation['max_drawdown']:.2f}%")
     currency = f" {broker['currency']}" if broker.get("currency") else ""
     broker_balance = (
-        f"${broker['balance']:,.2f}{currency}"
+        f"{broker.get('currency') or 'CUR'} {broker['balance']:,.2f}"
         if broker.get("balance") is not None else "Unavailable"
     )
     cols[7].metric("Broker account", broker_balance)
@@ -433,6 +439,10 @@ def render_account_separation():
     st.caption(
         f"Strategy simulation is independent. Broker metadata: "
         f"{broker['provider']} / {broker_type}; broker balance is not used for simulation risk."
+    )
+    st.caption(
+        "Trade journal outcomes are user-recorded scenarios. They do not establish broker execution; "
+        "archived M15 excursions are approximate OHLC observations."
     )
 
 
@@ -520,20 +530,131 @@ def render_signal_card(setup, lifecycle, rank):
             simulation_plan = {}
         if simulation_plan:
             size = simulation_plan.get("position_size")
-            size_text = f"{size:g}" if size is not None else "not executable"
+            size_text = f"{size:g} (configured scenario)" if size is not None else "not calculable"
+            currency = simulation_plan.get("currency", config.SIMULATION_ACCOUNT_CURRENCY)
+            reward = (
+                simulation_plan.get("sized_expected_profit")
+                if size is not None else simulation_plan.get("expected_profit")
+            )
+            reward_label = "sized reward" if size is not None else "budget-level reward scenario"
             st.caption(
-                f"Simulation risk ${simulation_plan.get('risk_amount', 0):.2f} · "
-                f"planned reward ${simulation_plan.get('expected_profit', 0):.2f} · "
-                f"volume {size_text} · {simulation_plan.get('sizing_status', 'unknown')}"
+                f"Simulation risk budget {currency} {simulation_plan.get('risk_amount', 0):.2f} · "
+                f"{reward_label} {currency} {reward or 0:.2f} · "
+                f"volume {size_text} · sizing {simulation_plan.get('sizing_status', 'unknown')} · "
+                f"account feasibility {simulation_plan.get('account_feasibility', 'unknown')}"
             )
 
-        action_cols = st.columns(2)
-        if action_cols[0].button("Reviewed / Dismiss", key=f"review_setup_{setup['id']}"):
-            mark_setup_reviewed(setup["id"])
+        ai_view = build_ai_advisory_view(setup)
+        with st.expander("AI advisory review", expanded=False):
+            if ai_view["available"]:
+                st.caption("Advisory only. Signal levels and account sizing remain deterministic.")
+                st.write(
+                    f"**{ai_view.get('decision', '—')}** · "
+                    f"quality {ai_view.get('quality_score', '—')}/100 · "
+                    f"confidence {ai_view.get('confidence', '—')}"
+                )
+                if ai_view.get("summary"):
+                    st.write(ai_view["summary"])
+                for key, label in (("reasons", "Reasons"), ("invalidations", "Invalidations")):
+                    items = ai_view[key]
+                    if items:
+                        st.markdown(f"**{label}**")
+                        for item in items:
+                            st.markdown(f"- {item}")
+                if ai_view.get("risk_note"):
+                    st.caption(f"Risk note: {ai_view['risk_note']}")
+                if ai_view.get("reviewed_at"):
+                    st.caption(f"Reviewed: {ai_view['reviewed_at']} UTC")
+            elif ai_view["status"] in {"unavailable", "invalid_response"}:
+                st.warning(ai_view["status_text"])
+            elif ai_view["status"] == "disabled":
+                st.info(ai_view["status_text"])
+            else:
+                st.caption(ai_view["status_text"])
+
+        telegram_status = setup.get("telegram_status")
+        if telegram_status:
+            delivery_text = {
+                "sent": "delivered",
+                "not_configured": "credentials not configured",
+                "failed": "delivery failed",
+            }.get(telegram_status, telegram_status)
+            st.caption(f"Telegram alert: {delivery_text}")
+            if setup.get("telegram_error"):
+                st.caption(f"Delivery detail: {setup['telegram_error'][:180]}")
+        lifecycle_delivery = setup.get("lifecycle_telegram_status")
+        if lifecycle_delivery:
+            st.caption(f"Telegram lifecycle update: {lifecycle_delivery}")
+
+        tracking_action = setup.get("tracking_action") or "UNREVIEWED"
+        action_labels = {
+            "UNREVIEWED": "Not reviewed",
+            "PAPER_TRACKED": "Paper tracked",
+            "SKIPPED": "Skipped",
+            "TRADE_LOGGED": "Trade journal linked (fill unverified)",
+        }
+        st.caption(f"Your decision: {action_labels.get(tracking_action, tracking_action)}")
+        if setup.get("tracking_reason"):
+            st.caption(f"Decision note: {setup['tracking_reason']}")
+
+        modeled_status = setup.get("modeled_status") or "PENDING"
+        modeled_labels = {
+            "PENDING": "Outcome model pending",
+            "WAITING_FOR_BARS": "Waiting for closed M15 bars",
+            "PENDING_ENTRY": "Waiting for modeled entry",
+            "MODELED_OPEN": "Modeled setup still open",
+            "TP1": "Modeled TP1 reached",
+            "STOP_LOSS": "Modeled stop reached",
+            "UNFILLED": "Modeled entry unfilled",
+            "UNRESOLVED": "No modeled exit within horizon",
+            "DATA_UNAVAILABLE": "Outcome data unavailable",
+            "INVALID_SETUP": "Outcome could not be modeled",
+        }
+        st.caption(f"Signal scenario: {modeled_labels.get(modeled_status, modeled_status)}")
+        if setup.get("modeled_gross_r") is not None:
+            st.caption(f"Modeled gross result: {setup['modeled_gross_r']:+.2f}R (OHLC estimate)")
+        if setup.get("modeled_notes"):
+            st.caption(setup["modeled_notes"])
+
+        decision_cols = st.columns(2)
+        if tracking_action == "PAPER_TRACKED":
+            decision_cols[0].caption("Paper tracking is on")
+        elif (tracking_action != "TRADE_LOGGED"
+                and decision_cols[0].button("Paper Track", key=f"paper_setup_{setup['id']}")):
+            record_setup_decision(setup["id"], "PAPER_TRACKED")
             st.rerun()
-        if action_cols[1].button("Log Trade From Setup", key=f"log_setup_{setup['id']}"):
+
+        if not setup.get("linked_trade_id") and decision_cols[1].button(
+            "Log Trade From Setup", key=f"log_setup_{setup['id']}"
+        ):
             st.session_state["trade_setup_id"] = setup["id"]
             st.rerun()
+
+        if tracking_action != "TRADE_LOGGED":
+            with st.expander("Record why you skipped this setup", expanded=False):
+                with st.form(f"skip_setup_form_{setup['id']}"):
+                    skip_reason = st.selectbox(
+                        "Reason",
+                        [
+                            "No confirmation",
+                            "Risk or account unsuitable",
+                            "Reward/risk too low",
+                            "News or volatility concern",
+                            "Already in another trade",
+                            "Price moved before entry",
+                            "Other",
+                        ],
+                        key=f"skip_reason_{setup['id']}",
+                    )
+                    skip_note = st.text_input(
+                        "Optional detail", key=f"skip_note_{setup['id']}"
+                    )
+                    if st.form_submit_button("Save skipped decision"):
+                        reason = skip_reason
+                        if skip_note.strip():
+                            reason = f"{reason}: {skip_note.strip()}"
+                        record_setup_decision(setup["id"], "SKIPPED", reason)
+                        st.rerun()
 
 
 def get_dashboard_setups():
@@ -563,8 +684,30 @@ def get_dashboard_setups():
             news_reason=news_reason,
             reviewed=bool(setup.get("reviewed_at")),
             trade_logged=trade is not None,
+            entry_touched=bool(setup.get("entry_touched_at")),
+            market_source=config.MARKET_DATA_SOURCE_LABEL,
         )
-        update_setup_lifecycle(setup["id"], lifecycle["state"], lifecycle["reason"])
+        previous_state = str(setup.get("lifecycle_state") or "ACTIVE").upper()
+        updated = update_setup_lifecycle(
+            setup["id"], lifecycle["state"], lifecycle["reason"],
+            entry_touched_at=lifecycle.get("entry_touched_at"),
+        )
+        if (updated and previous_state != lifecycle["state"]
+                and lifecycle["state"] in {"ENTRY TOUCHED", "STALE", "INVALIDATED", "NEWS BLOCKED", "PRICE UNKNOWN"}):
+            try:
+                sent = send_lifecycle_update(setup, lifecycle)
+                delivery = get_last_delivery_status()
+            except Exception:
+                sent = False
+                delivery = {"status": "failed", "error": "Lifecycle notification handler failed."}
+            status = (
+                "sent" if sent
+                else "not_configured" if delivery.get("status") == "not_configured"
+                else "failed"
+            )
+            record_setup_lifecycle_notification(
+                setup["id"], status, error=delivery.get("error")
+            )
         evaluated.append((setup, lifecycle))
 
     ready = [(setup, state) for setup, state in evaluated if state["state"] == "READY"]
@@ -590,21 +733,84 @@ def render_setup_trade_form(setups_by_id):
         col3, col4 = st.columns(2)
         stop = col3.number_input("Stop Loss", value=float(setup["sl"] or 0), format="%.5f")
         target = col4.number_input("Take Profit", value=float(setup["tp1"] or 0), format="%.5f")
+        execution = render_trade_execution_inputs(f"setup_{setup_id}")
         notes = st.text_input("Notes")
         save_trade = st.form_submit_button("Save to Trade Journal", type="primary")
     if save_trade:
-        simulation_plan = build_simulation_trade_plan(
-            setup["symbol"], entry, stop,
-        )
-        log_trade(
-            setup["symbol"], direction, entry, stop, target,
-            grade=setup.get("grade"), score=setup.get("score"),
-            session=setup.get("session"), setup_id=setup_id, notes=notes,
-            simulation_plan=simulation_plan,
-        )
+        try:
+            simulation_plan = (
+                build_simulation_trade_plan(setup["symbol"], entry, stop)
+                if execution["execution_mode"] == "PAPER" else None
+            )
+            log_trade(
+                setup["symbol"], direction, entry, stop, target,
+                grade=setup.get("grade"), score=setup.get("score"),
+                session=setup.get("session"), setup_id=setup_id, notes=notes,
+                simulation_plan=simulation_plan, tp2=setup.get("tp2"),
+                **execution,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
         st.session_state.pop("trade_setup_id", None)
-        st.success("Trade linked to setup. Record the outcome from Trade Journal when it closes.")
+        mode_label = "paper simulation" if execution["execution_mode"] == "PAPER" else "manually reported trade"
+        st.success(f"{mode_label.capitalize()} linked to setup. Record the outcome when it closes.")
         st.rerun()
+
+
+def render_trade_execution_inputs(key_prefix):
+    st.caption("Execution details are user-entered. The journal does not verify broker fills.")
+    mode_label = st.selectbox(
+        "Execution record",
+        ["Paper simulation", "Manually taken (reported)"],
+        key=f"execution_mode_{key_prefix}",
+        help="Manually reported trades are kept separate from the simulation account.",
+    )
+    execution_mode = "PAPER" if mode_label == "Paper simulation" else "MANUAL_REPORTED"
+    entry_time = st.datetime_input(
+        "Entry time (UTC)",
+        value=datetime.now(timezone.utc).replace(tzinfo=None),
+        key=f"entry_time_{key_prefix}",
+    )
+    size_col, risk_col, currency_col = st.columns(3)
+    position_size = size_col.number_input(
+        "Position size (optional)", min_value=0.0, value=0.0, step=0.01,
+        key=f"position_size_{key_prefix}",
+    )
+    actual_risk = risk_col.number_input(
+        "Amount at risk (optional)", min_value=0.0, value=0.0, step=0.01,
+        key=f"actual_risk_{key_prefix}",
+    )
+    risk_currency = currency_col.text_input(
+        "Risk currency", value=config.SIMULATION_ACCOUNT_CURRENCY,
+        key=f"risk_currency_{key_prefix}",
+    )
+    record_costs = st.checkbox(
+        "Record total commission, spread and swap costs",
+        value=False, key=f"record_costs_{key_prefix}",
+    )
+    if record_costs:
+        cost_col, cost_currency_col = st.columns(2)
+        transaction_cost = cost_col.number_input(
+            "Total costs", min_value=0.0, value=0.0, step=0.01,
+            key=f"transaction_cost_{key_prefix}",
+        )
+        cost_currency = cost_currency_col.text_input(
+            "Cost currency", value=config.SIMULATION_ACCOUNT_CURRENCY,
+            key=f"cost_currency_{key_prefix}",
+        )
+    else:
+        transaction_cost = None
+        cost_currency = None
+    return {
+        "execution_mode": execution_mode,
+        "entry_triggered_at": entry_time,
+        "position_size": position_size or None,
+        "actual_risk_amount": actual_risk or None,
+        "risk_currency": risk_currency.strip().upper() if actual_risk else None,
+        "transaction_cost_amount": transaction_cost,
+        "cost_currency": cost_currency.strip().upper() if transaction_cost is not None else None,
+    }
 
 
 def main():
@@ -617,7 +823,7 @@ def main():
         page = st.radio(
             "Navigation",
             ["Dashboard", "Economic Calendar", "Active Setups",
-             "Trade Journal", "Analytics", "Daily Review", "Risk Status"],
+             "Signal Ledger", "Trade Journal", "Analytics", "Daily Review", "Risk Status"],
             label_visibility="collapsed",
         )
         st.divider()
@@ -634,6 +840,8 @@ def main():
         show_calendar()
     elif page == "Active Setups":
         show_active_setups()
+    elif page == "Signal Ledger":
+        show_signal_ledger()
     elif page == "Trade Journal":
         show_journal()
     elif page == "Analytics":
@@ -905,6 +1113,117 @@ def show_active_setups():
                          width="stretch")
 
 
+def show_signal_ledger():
+    st.header("Signal Ledger")
+    st.caption(
+        "Every emitted setup is assessed independently from your decision to trade it. "
+        "Modeled outcomes are M15 OHLC scenarios; they do not confirm fills or replace the Trade Journal."
+    )
+    if st.button("Refresh modeled outcomes", key="refresh_signal_outcomes"):
+        result = refresh_setup_outcomes(config.MARKET_DATA_SOURCE_LABEL, limit=100)
+        st.success(
+            f"Checked {result['checked']} setups; updated {result['updated']}; "
+            f"{result['terminal']} reached a final modeled state."
+        )
+
+    rows = get_signal_ledger(limit=2000)
+    if not rows:
+        st.info("No signal records yet. New scanner setups will appear here automatically.")
+        return
+    frame = pd.DataFrame(rows)
+    frame["tracking_action"] = frame["tracking_action"].fillna("UNREVIEWED")
+    frame["modeled_status"] = frame["modeled_status"].fillna("PENDING")
+
+    resolved = frame[
+        frame["modeled_status"].isin(["TP1", "STOP_LOSS"])
+        & frame["modeled_gross_r"].notna()
+    ]
+    modeled_win_rate = (
+        (resolved["modeled_status"] == "TP1").mean() if not resolved.empty else None
+    )
+    paper_count = int((frame["tracking_action"] == "PAPER_TRACKED").sum())
+    skipped_count = int((frame["tracking_action"] == "SKIPPED").sum())
+    linked_count = int(frame["linked_trade_id"].notna().sum())
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Signals in view", len(frame))
+    metric_cols[1].metric("Paper tracked", paper_count)
+    metric_cols[2].metric("Skipped with reason", skipped_count)
+    metric_cols[3].metric("Journal-linked trades", linked_count)
+
+    paper_net = frame[
+        (frame["journal_execution_mode"] == "PAPER") & frame["journal_net_r"].notna()
+    ]
+    reported_net = frame[
+        (frame["journal_execution_mode"] == "MANUAL_REPORTED") & frame["journal_net_r"].notna()
+    ]
+    result_cols = st.columns(4)
+    result_cols[0].metric(
+        "Modeled resolved",
+        len(resolved),
+        f"{modeled_win_rate:.1%} TP1" if modeled_win_rate is not None else "No resolved estimates yet",
+    )
+    result_cols[1].metric(
+        "Modeled mean gross R",
+        f"{resolved['modeled_gross_r'].mean():+.2f}R" if not resolved.empty else "—",
+    )
+    result_cols[2].metric(
+        "Paper mean net R",
+        f"{paper_net['journal_net_r'].mean():+.2f}R" if not paper_net.empty else "—",
+        f"{len(paper_net)} with risk and costs",
+    )
+    result_cols[3].metric(
+        "Reported mean net R",
+        f"{reported_net['journal_net_r'].mean():+.2f}R" if not reported_net.empty else "—",
+        f"{len(reported_net)} with risk and costs",
+    )
+
+    filter_cols = st.columns(2)
+    action_options = ["All"] + sorted(frame["tracking_action"].dropna().unique().tolist())
+    status_options = ["All"] + sorted(frame["modeled_status"].dropna().unique().tolist())
+    action_filter = filter_cols[0].selectbox("Decision", action_options)
+    status_filter = filter_cols[1].selectbox("Modeled outcome status", status_options)
+    visible = frame
+    if action_filter != "All":
+        visible = visible[visible["tracking_action"] == action_filter]
+    if status_filter != "All":
+        visible = visible[visible["modeled_status"] == status_filter]
+
+    columns = [
+        "id", "detected_at", "symbol", "signal_type", "grade", "score",
+        "tracking_action", "tracking_reason", "modeled_status", "modeled_outcome",
+        "modeled_gross_r", "journal_execution_mode", "journal_outcome",
+        "journal_gross_r", "journal_net_r", "journal_position_size",
+        "journal_actual_risk", "journal_risk_currency", "journal_transaction_costs",
+        "journal_cost_currency", "modeled_source",
+    ]
+    display = visible[[column for column in columns if column in visible.columns]].rename(columns={
+        "id": "Setup ID",
+        "detected_at": "Detected (UTC)",
+        "signal_type": "Signal",
+        "tracking_action": "Your decision",
+        "tracking_reason": "Decision reason",
+        "modeled_status": "Scenario status",
+        "modeled_outcome": "Scenario outcome",
+        "modeled_gross_r": "Scenario gross R",
+        "journal_outcome": "Journal result",
+        "journal_gross_r": "Journal gross R",
+        "journal_net_r": "Journal net R",
+        "journal_execution_mode": "Execution record",
+        "journal_position_size": "Reported size",
+        "journal_actual_risk": "Reported risk",
+        "journal_risk_currency": "Risk currency",
+        "journal_transaction_costs": "Reported costs",
+        "journal_cost_currency": "Cost currency",
+        "modeled_source": "Bar source",
+    })
+    st.dataframe(display, width="stretch", hide_index=True)
+    st.caption(
+        f"Showing {len(visible)} of the latest {len(frame)} setups. Scenario results use configured-source M15 OHLC, "
+        "four pending bars and a 96-bar horizon. Same-bar SL/TP1 collisions count as losses; costs and intrabar order are unknown."
+    )
+
+
 # ─────────────────────────────────────────────
 # Trade Journal
 # ─────────────────────────────────────────────
@@ -918,29 +1237,43 @@ def show_journal():
             c1, c2 = st.columns(2)
             symbol = c1.selectbox("Symbol", config.SYMBOLS)
             direction = c2.radio("Direction", ["Buy", "Sell"], horizontal=True)
-            c3, c4, c5 = st.columns(3)
+            c3, c4, c5, c6 = st.columns(4)
             entry = c3.number_input("Entry", format="%.5f", value=0.0)
             sl = c4.number_input("Stop Loss", format="%.5f", value=0.0)
-            tp = c5.number_input("Take Profit", format="%.5f", value=0.0)
+            tp = c5.number_input("TP1", format="%.5f", value=0.0)
+            tp2 = c6.number_input("TP2 (optional)", format="%.5f", value=0.0)
             grade = st.selectbox("Setup Grade", ["Standard", "A", "A+", "ELITE"])
+            execution = render_trade_execution_inputs("manual")
             notes = st.text_area("Notes", height=80)
             if st.form_submit_button("Log Trade", type="primary"):
-                simulation_plan = build_simulation_trade_plan(symbol, entry, sl)
-                tid = log_trade(
-                    symbol, direction, entry, sl, tp, grade=grade, notes=notes,
-                    simulation_plan=simulation_plan,
-                )
-                st.success(f"Trade #{tid} logged.")
-                st.caption(
-                    f"Simulation risk ${simulation_plan['risk_amount']:.2f}; "
-                    f"2R reward ${simulation_plan['expected_profit']:.2f}; "
-                    f"volume status: {simulation_plan['sizing_status']}"
-                )
-                if simulation_plan["sizing_status"] != "OK":
-                    st.warning(
-                        "Simulation risk was recorded, but broker volume is not executable: "
-                        f"{simulation_plan['sizing_status']}. No size was rounded up."
+                try:
+                    simulation_plan = (
+                        build_simulation_trade_plan(symbol, entry, sl)
+                        if execution["execution_mode"] == "PAPER" else None
                     )
+                    tid = log_trade(
+                        symbol, direction, entry, sl, tp, grade=grade, notes=notes,
+                        simulation_plan=simulation_plan, tp2=tp2 if tp2 > 0 else None,
+                        **execution,
+                    )
+                except ValueError as exc:
+                    st.error(str(exc))
+                else:
+                    st.success(f"Trade #{tid} logged as {execution['execution_mode']}.")
+                    if simulation_plan:
+                        currency = simulation_plan.get("currency", config.SIMULATION_ACCOUNT_CURRENCY)
+                        st.caption(
+                            f"Simulation risk budget {currency} {simulation_plan['risk_amount']:.2f}; "
+                            f"budget-level 2R scenario {currency} {simulation_plan['expected_profit']:.2f}; "
+                            f"volume status: {simulation_plan['sizing_status']}"
+                        )
+                        if simulation_plan["sizing_status"] != "OK":
+                            st.warning(
+                                "Simulation risk was recorded, but broker volume is not executable: "
+                                f"{simulation_plan['sizing_status']}. No size was rounded up."
+                            )
+                    else:
+                        st.caption("Manually reported trades are excluded from simulation account P/L.")
 
     with tab2:
         trades = get_all_trades()
@@ -949,17 +1282,52 @@ def show_journal():
             st.dataframe(df, width="stretch")
             st.divider()
             st.subheader("Close a Trade")
+            st.caption(
+                "Gross R is calculated from entry, stop, direction, and exit price. Net R is shown only when "
+                "reported risk and total costs are known in the same currency. MFE/MAE are approximate "
+                "M15 candle estimates; they do not confirm broker fills or intrabar order."
+            )
             with st.form("close_trade_form"):
-                open_ids = [t["id"] for t in trades if not t.get("outcome")]
-                if open_ids:
-                    tid = st.selectbox("Trade ID", open_ids)
+                open_trades = [t for t in trades if not t.get("outcome")]
+                if open_trades:
+                    trade_by_id = {t["id"]: t for t in open_trades}
+                    tid = st.selectbox(
+                        "Trade ID", list(trade_by_id),
+                        format_func=lambda trade_id: (
+                            f"#{trade_id} {trade_by_id[trade_id]['symbol']} "
+                            f"{trade_by_id[trade_id]['direction']} "
+                            f"({trade_by_id[trade_id].get('execution_mode') or 'UNSPECIFIED'})"
+                        ),
+                    )
                     exit_p = st.number_input("Exit Price", format="%.5f")
                     outcome = st.radio("Outcome", ["win", "loss", "breakeven"], horizontal=True)
-                    rr = st.number_input("RR Achieved", value=0.0, step=0.1)
+                    exit_time = st.datetime_input(
+                        "Exit time (UTC)",
+                        value=datetime.now(timezone.utc).replace(tzinfo=None),
+                    )
+                    exit_reason = st.selectbox("Exit reason", ["MANUAL_EXIT", "TP1", "TP2", "SL", "OTHER"])
+                    close_costs_known = st.checkbox("Record or update total transaction costs", value=False)
+                    if close_costs_known:
+                        cost_col, currency_col = st.columns(2)
+                        close_cost_amount = cost_col.number_input(
+                            "Total commission, spread and swap costs",
+                            min_value=0.0, value=0.0, step=0.01,
+                        )
+                        close_cost_currency = currency_col.text_input(
+                            "Cost currency", value=config.SIMULATION_ACCOUNT_CURRENCY,
+                        )
+                    else:
+                        close_cost_amount = None
+                        close_cost_currency = None
                     close_notes = st.text_input("Notes")
                     if st.form_submit_button("Close Trade"):
                         try:
-                            close_trade(tid, exit_p, outcome, rr, close_notes)
+                            close_trade(
+                                tid, exit_p, outcome, notes=close_notes,
+                                exit_reason=exit_reason, closed_at=exit_time,
+                                transaction_cost_amount=close_cost_amount,
+                                cost_currency=close_cost_currency,
+                            )
                         except ValueError as exc:
                             st.error(str(exc))
                         else:
